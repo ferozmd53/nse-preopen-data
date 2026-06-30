@@ -2,7 +2,7 @@ name: Daily NSE Pre-Open Data Fetch
 
 on:
   schedule:
-    - cron: '11 49 * * 1-5'   # 9:45 AM IST, Mon-Fri
+    - cron: '35 23 * * 1-5'   # 9:45 AM IST, Mon-Fri
   workflow_dispatch:
 
 jobs:
