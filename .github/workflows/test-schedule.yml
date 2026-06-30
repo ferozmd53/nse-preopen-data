@@ -1,13 +1,14 @@
-name: Test Schedule
+name: Simple Test
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # Every 5 minutes
+    - cron: '*/5 * * * *'
   workflow_dispatch:
+  push:
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Print hello
-        run: echo "Hello Feroz! Scheduled run at $(date)"
+      - name: Print Time
+        run: echo "Hello! Current time is $(date)"
