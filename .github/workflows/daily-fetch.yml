@@ -2,7 +2,7 @@ name: NSE Pre-Open Data Fetcher
 
 on:
   schedule:
-    - cron: '* * * * *'   # Every minute (for testing)
+    - cron: '*/5 * * * *'   # Every minute (for testing)
   workflow_dispatch:
 
 permissions:
