@@ -2,7 +2,7 @@ name: NSE Pre-Open Data Fetcher
 
 on:
   schedule:
-    - cron: '18 13 * * 1-5'   # 12:47 PM UTC = 6:17 PM IST
+    - cron: '18 13 * * 1-5'   # 12:47 PM UTC = 6:17 PM IS
   workflow_dispatch:
 
 permissions:
