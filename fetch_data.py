@@ -5,18 +5,47 @@ import os
 import csv
 import traceback
 import sys
-from datetime import datetime as dt  # ← ADD THIS LINE (for timestamp)
+import glob
 
 URL = "https://www.nseindia.com/api/market-data-pre-open?key=FO"
-HOME_URL = "https://www.nseindia.com"
+HOME_URL = "https://www.nseindia.com/report-detail/fo_eq_security"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market",
+    "Referer": "https://www.nseindia.com/report-detail/fo_eq_security",
 }
+
+def get_next_filename(base_name):
+    """
+    Get the next available filename with number suffix.
+    Example: if base_name.csv exists, returns base_name (1).csv
+    """
+    # First, check if the base file exists
+    base_file = f"data/{base_name}.csv"
+    if not os.path.exists(base_file):
+        return base_file
+    
+    # If it exists, find the next number
+    pattern = f"data/{base_name} (*).csv"
+    existing_files = glob.glob(pattern)
+    
+    # Extract numbers from existing files
+    numbers = []
+    for f in existing_files:
+        # Extract number between ( and )
+        try:
+            num = int(f.split('(')[1].split(')')[0])
+            numbers.append(num)
+        except:
+            continue
+    
+    # Find the next number
+    next_num = max(numbers) + 1 if numbers else 1
+    
+    return f"data/{base_name} ({next_num}).csv"
 
 def fetch_json_data():
     """Fetch JSON data from NSE API"""
@@ -49,16 +78,18 @@ def fetch_json_data():
     return response.json()
 
 def parse_and_save(json_data):
-    """Parse JSON and save as CSV"""
+    """Parse JSON and save as CSV with number suffix"""
     print("🔍 Debug: Starting parse_and_save...")
     
-    # Get today's date and timestamp
-    today = datetime.date.today().isoformat()
-    timestamp = dt.now().strftime("%H%M")  # ← ADD THIS LINE
-    
-    # Create filename with timestamp
+    # Create data folder if it doesn't exist
     os.makedirs("data", exist_ok=True)
-    filename = f"data/preopen_fo_{today}_{timestamp}.csv"  # ← CHANGED THIS LINE
+    
+    # Base filename (without extension)
+    today = datetime.date.today().isoformat()
+    base_name = f"preopen_fo_{today}"
+    
+    # Get the next available filename
+    filename = get_next_filename(base_name)
     print(f"📁 Saving to: {filename}")
     
     records = []
