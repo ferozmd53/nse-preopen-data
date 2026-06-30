@@ -5,6 +5,7 @@ import os
 import csv
 import traceback
 import sys
+from datetime import datetime as dt  # ← ADD THIS LINE (for timestamp)
 
 URL = "https://www.nseindia.com/api/market-data-pre-open?key=FO"
 HOME_URL = "https://www.nseindia.com"
@@ -51,9 +52,13 @@ def parse_and_save(json_data):
     """Parse JSON and save as CSV"""
     print("🔍 Debug: Starting parse_and_save...")
     
+    # Get today's date and timestamp
     today = datetime.date.today().isoformat()
+    timestamp = dt.now().strftime("%H%M")  # ← ADD THIS LINE
+    
+    # Create filename with timestamp
     os.makedirs("data", exist_ok=True)
-    filename = f"data/preopen_fo_{today}.csv"
+    filename = f"data/preopen_fo_{today}_{timestamp}.csv"  # ← CHANGED THIS LINE
     print(f"📁 Saving to: {filename}")
     
     records = []
