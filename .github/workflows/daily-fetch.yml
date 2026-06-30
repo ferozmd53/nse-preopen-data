@@ -2,21 +2,30 @@ name: Daily NSE Pre-Open Data Fetch
 
 on:
   schedule:
-    - cron: '48 11 * * 1-5'   # 9:45 AM IST, Mon-Fri
+    - cron: '48 11 * * 1-5'   # 11:48 AM UTC = 5:18 PM IST
   workflow_dispatch:
+
+# ⭐ ADD THIS PERMISSIONS SECTION ⭐
+permissions:
+  contents: write
+  actions: read
 
 jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      
       - name: Install dependencies
         run: pip install requests
+      
       - name: Run fetch script
         run: python fetch_data.py
+      
       - name: Commit and push if changed
         run: |
           git config user.name "github-actions[bot]"
