@@ -2,7 +2,7 @@ name: Daily NSE Pre-Open Data Fetch
 
 on:
   schedule:
-    - cron: '06 12 * * 1-5'   # 11:48 AM UTC = 5:18 PM IST
+    - cron: '28 12 * * 1-5'   # 11:48 AM UTC = 5:18 PM IST
   workflow_dispatch:
 
 # ⭐ ADD THIS PERMISSIONS SECTION ⭐
