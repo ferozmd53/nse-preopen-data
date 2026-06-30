@@ -2,7 +2,7 @@ name: Daily NSE Pre-Open Data Fetch
 
 on:
   schedule:
-    - cron: '47 12 * * 1-5'
+    - cron: '54 12 * * 1-5'
   workflow_dispatch:
 
 permissions:
