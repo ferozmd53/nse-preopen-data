@@ -1,8 +1,8 @@
-name: Daily NSE Pre-Open Data Fetch
+name: NSE Pre-Open Data Fetcher
 
 on:
   schedule:
-    - cron: '54 12 * * 1-5'
+    - cron: '47 12 * * 1-5'   # 12:47 PM UTC = 6:17 PM IST
   workflow_dispatch:
 
 permissions:
@@ -10,8 +10,9 @@ permissions:
   actions: read
 
 jobs:
-  fetch:
+  fetch-data:
     runs-on: ubuntu-latest
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,13 +25,13 @@ jobs:
       - name: Install dependencies
         run: pip install requests
       
-      - name: Run fetch script
+      - name: Fetch NSE data
         run: python fetch_data.py
       
-      - name: Commit and push if changed
+      - name: Commit and push data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/
-          git diff --staged --quiet || git commit -m "Daily NSE pre-open data $(date +'%Y-%m-%d')"
+          git diff --staged --quiet || git commit -m "NSE pre-open data $(date +'%Y-%m-%d %H:%M')"
           git push
