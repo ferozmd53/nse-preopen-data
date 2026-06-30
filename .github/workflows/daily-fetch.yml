@@ -2,7 +2,7 @@ name: NSE Pre-Open Data Fetcher
 
 on:
   schedule:
-    - cron: '18 13 * * 1-5'   # 12:47 PM UTC = 6:17 PM IS
+    - cron: '*/5 * * * 1-5'   # Every 5 minutes (Monday-Friday)
   workflow_dispatch:
 
 permissions:
@@ -12,22 +12,22 @@ permissions:
 jobs:
   fetch-data:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install dependencies
         run: pip install requests
-      
+
       - name: Fetch NSE data
         run: python fetch_data.py
-      
+
       - name: Commit and push data
         run: |
           git config user.name "github-actions[bot]"
