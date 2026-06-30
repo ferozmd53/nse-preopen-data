@@ -3,6 +3,8 @@ import datetime
 import json
 import os
 import csv
+import traceback
+import sys
 
 URL = "https://www.nseindia.com/api/market-data-pre-open?key=FO"
 HOME_URL = "https://www.nseindia.com"
@@ -17,27 +19,48 @@ HEADERS = {
 
 def fetch_json_data():
     """Fetch JSON data from NSE API"""
+    print("🔍 Debug: Starting fetch_json_data...")
+    print(f"🔍 Python version: {sys.version}")
+    
     session = requests.Session()
     session.headers.update(HEADERS)
     
     print("🌐 Connecting to NSE...")
-    session.get(HOME_URL, timeout=10)
+    try:
+        home_response = session.get(HOME_URL, timeout=10)
+        print(f"   Homepage status: {home_response.status_code}")
+        print(f"   Cookies: {len(session.cookies)} cookies")
+    except Exception as e:
+        print(f"❌ Homepage error: {e}")
+        raise
     
     print("📊 Fetching F&O pre-open data...")
-    response = session.get(URL, timeout=10)
-    response.raise_for_status()
+    try:
+        response = session.get(URL, timeout=10)
+        print(f"   Response status: {response.status_code}")
+        response.raise_for_status()
+    except Exception as e:
+        print(f"❌ API error: {e}")
+        print(f"   Response: {response.text[:200] if 'response' in locals() else 'No response'}")
+        raise
     
+    print("✅ Data fetched successfully")
     return response.json()
 
 def parse_and_save(json_data):
     """Parse JSON and save as CSV"""
+    print("🔍 Debug: Starting parse_and_save...")
+    
     today = datetime.date.today().isoformat()
     os.makedirs("data", exist_ok=True)
     filename = f"data/preopen_fo_{today}.csv"
+    print(f"📁 Saving to: {filename}")
     
     records = []
+    data_list = json_data.get('data', [])
+    print(f"📊 Found {len(data_list)} items in data")
     
-    for item in json_data.get('data', []):
+    for item in data_list:
         metadata = item.get('metadata', {})
         detail = item.get('detail', {})
         preopen = detail.get('preOpenMarket', {})
@@ -74,28 +97,46 @@ def parse_and_save(json_data):
             'TOTAL_SELL_QTY': sell_qty,
             'ADV_DECL': adv_decl
         }
-        
         records.append(record)
     
     # Write to CSV
-    with open(filename, 'w', newline='', encoding='utf-8-sig') as f:
-        fieldnames = ['SYMBOL', 'PREOPEN', 'FINAL_PRICE', 'FINAL_QUANTITY', 
-                     'LAST_UPDATE', 'TOTAL_BUY_QTY', 'TOTAL_SELL_QTY', 'ADV_DECL']
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(records)
+    try:
+        with open(filename, 'w', newline='', encoding='utf-8-sig') as f:
+            fieldnames = ['SYMBOL', 'PREOPEN', 'FINAL_PRICE', 'FINAL_QUANTITY', 
+                         'LAST_UPDATE', 'TOTAL_BUY_QTY', 'TOTAL_SELL_QTY', 'ADV_DECL']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(records)
+        
+        # Verify file was created
+        if os.path.exists(filename):
+            file_size = os.path.getsize(filename)
+            print(f"✅ File created: {filename} ({file_size} bytes)")
+        else:
+            print(f"❌ File NOT created at {filename}")
+            return []
+            
+    except Exception as e:
+        print(f"❌ Error saving file: {e}")
+        raise
     
     print(f"✅ Saved: {filename}")
     print(f"📊 Records: {len(records)}")
-    
     return records
 
 if __name__ == "__main__":
+    print("=" * 60)
+    print("🚀 Starting NSE data fetch...")
+    print(f"📅 Time: {datetime.datetime.now()}")
+    print(f"📁 Current directory: {os.getcwd()}")
+    print("=" * 60)
+    
     try:
         json_data = fetch_json_data()
         records = parse_and_save(json_data)
         
         if records:
+            print(f"\n✅ Success! {len(records)} records saved.")
             print("\n📋 Sample Data (first 5 rows):")
             print("-" * 80)
             for i, record in enumerate(records[:5]):
@@ -104,6 +145,12 @@ if __name__ == "__main__":
                       f"Buy: {record['TOTAL_BUY_QTY']:>6} | "
                       f"Sell: {record['TOTAL_SELL_QTY']:>6} | "
                       f"{record['ADV_DECL']}")
-    
+        else:
+            print("❌ No records saved")
+            
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"\n❌ ERROR: {e}")
+        print("\n📋 Full traceback:")
+        traceback.print_exc()
+    
+    print("=" * 60)
