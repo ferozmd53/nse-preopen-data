@@ -6,8 +6,15 @@ import csv
 import traceback
 import sys
 import glob
+import re
+import time
 
-URL = "https://www.nseindia.com/api/market-data-pre-open?key=FO"
+# Define both URLs
+URLS = [
+    "https://www.nseindia.com/api/market-data-pre-open?key=NIFTY",
+    "https://www.nseindia.com/api/market-data-pre-open?key=FO"
+]
+
 HOME_URL = "https://www.nseindia.com/report-detail/fo_eq_security"
 
 HEADERS = {
@@ -18,18 +25,39 @@ HEADERS = {
     "Referer": "https://www.nseindia.com/report-detail/fo_eq_security",
 }
 
+def get_filename_from_url(url):
+    """
+    Get filename based on URL parameters
+    URL: https://www.nseindia.com/api/market-data-pre-open?key=NIFTY
+    Returns: pre-open-NIFTY-DD-MMM-YYYY.csv
+    """
+    # Extract key from URL
+    key_match = re.search(r'key=([^&]+)', url)
+    key = key_match.group(1) if key_match else 'UNKNOWN'
+    
+    today = datetime.date.today()
+    # Format: DD-MMM-YYYY (e.g., 01-JUL-2026)
+    date_str = today.strftime("%d-%b-%Y").upper()
+    
+    return f"pre-open-{key}-{date_str}.csv"
+
 def get_next_filename(base_name):
     """
     Get the next available filename with number suffix.
     Example: if base_name.csv exists, returns base_name (1).csv
     """
+    # Create data folder if it doesn't exist
+    os.makedirs("data", exist_ok=True)
+    
     # First, check if the base file exists
-    base_file = f"data/{base_name}.csv"
+    base_file = f"data/{base_name}"
     if not os.path.exists(base_file):
         return base_file
     
     # If it exists, find the next number
-    pattern = f"data/{base_name} (*).csv"
+    base_without_ext = os.path.splitext(base_name)[0]
+    ext = os.path.splitext(base_name)[1]
+    pattern = f"data/{base_without_ext} (*){ext}"
     existing_files = glob.glob(pattern)
     
     # Extract numbers from existing files
@@ -45,28 +73,27 @@ def get_next_filename(base_name):
     # Find the next number
     next_num = max(numbers) + 1 if numbers else 1
     
-    return f"data/{base_name} ({next_num}).csv"
+    return f"data/{base_without_ext} ({next_num}){ext}"
 
-def fetch_json_data():
-    """Fetch JSON data from NSE API"""
-    print("🔍 Debug: Starting fetch_json_data...")
-    print(f"🔍 Python version: {sys.version}")
+def fetch_json_data(url):
+    """Fetch JSON data from NSE API for a specific URL"""
+    print(f"🔍 Fetching data from: {url}")
     
     session = requests.Session()
     session.headers.update(HEADERS)
     
-    print("🌐 Connecting to NSE...")
+    # First visit homepage to get cookies
     try:
         home_response = session.get(HOME_URL, timeout=10)
         print(f"   Homepage status: {home_response.status_code}")
-        print(f"   Cookies: {len(session.cookies)} cookies")
     except Exception as e:
         print(f"❌ Homepage error: {e}")
         raise
     
-    print("📊 Fetching F&O pre-open data...")
+    # Fetch API data
+    print(f"📊 Fetching pre-open data for {url.split('key=')[1]}...")
     try:
-        response = session.get(URL, timeout=10)
+        response = session.get(url, timeout=10)
         print(f"   Response status: {response.status_code}")
         response.raise_for_status()
     except Exception as e:
@@ -77,24 +104,28 @@ def fetch_json_data():
     print("✅ Data fetched successfully")
     return response.json()
 
-def parse_and_save(json_data):
-    """Parse JSON and save as CSV with number suffix"""
+def parse_and_save(json_data, url):
+    """Parse JSON and save as CSV with filename from URL key"""
     print("🔍 Debug: Starting parse_and_save...")
     
     # Create data folder if it doesn't exist
     os.makedirs("data", exist_ok=True)
     
-    # Base filename (without extension)
-    today = datetime.date.today().isoformat()
-    base_name = f"preopen_fo_{today}"
+    # Get the filename based on URL key
+    url_filename = get_filename_from_url(url)
+    print(f"📁 Filename from URL: {url_filename}")
     
-    # Get the next available filename
-    filename = get_next_filename(base_name)
+    # Get the next available filename (handles duplicates)
+    filename = get_next_filename(url_filename)
     print(f"📁 Saving to: {filename}")
     
     records = []
     data_list = json_data.get('data', [])
     print(f"📊 Found {len(data_list)} items in data")
+    
+    if not data_list:
+        print("⚠️ No data received from API")
+        return []
     
     for item in data_list:
         metadata = item.get('metadata', {})
@@ -160,33 +191,94 @@ def parse_and_save(json_data):
     print(f"📊 Records: {len(records)}")
     return records
 
-if __name__ == "__main__":
+def download_all():
+    """Download data for all URLs"""
     print("=" * 60)
-    print("🚀 Starting NSE data fetch...")
+    print("🚀 Starting NSE data fetch for multiple URLs...")
     print(f"📅 Time: {datetime.datetime.now()}")
     print(f"📁 Current directory: {os.getcwd()}")
     print("=" * 60)
     
-    try:
-        json_data = fetch_json_data()
-        records = parse_and_save(json_data)
+    all_results = []
+    total_records = 0
+    
+    for i, url in enumerate(URLS, 1):
+        print(f"\n{'='*60}")
+        print(f"📌 Processing URL {i}/{len(URLS)}: {url}")
+        print('='*60)
         
-        if records:
-            print(f"\n✅ Success! {len(records)} records saved.")
-            print("\n📋 Sample Data (first 5 rows):")
-            print("-" * 80)
-            for i, record in enumerate(records[:5]):
-                print(f"{i+1}. {record['SYMBOL']:12} | "
-                      f"IEP: {record['PREOPEN']:>8} | "
-                      f"Buy: {record['TOTAL_BUY_QTY']:>6} | "
-                      f"Sell: {record['TOTAL_SELL_QTY']:>6} | "
-                      f"{record['ADV_DECL']}")
-        else:
-            print("❌ No records saved")
+        try:
+            # Add a small delay between requests to avoid rate limiting
+            if i > 1:
+                print("⏳ Waiting 2 seconds before next request...")
+                time.sleep(2)
             
-    except Exception as e:
-        print(f"\n❌ ERROR: {e}")
-        print("\n📋 Full traceback:")
-        traceback.print_exc()
+            # Fetch data
+            json_data = fetch_json_data(url)
+            
+            # Parse and save
+            records = parse_and_save(json_data, url)
+            
+            if records:
+                total_records += len(records)
+                all_results.append({
+                    'url': url,
+                    'key': url.split('key=')[1],
+                    'records': len(records),
+                    'success': True
+                })
+                print(f"✅ Successfully processed {url.split('key=')[1]}")
+            else:
+                all_results.append({
+                    'url': url,
+                    'key': url.split('key=')[1],
+                    'records': 0,
+                    'success': False
+                })
+                print(f"❌ Failed to process {url.split('key=')[1]}")
+                
+        except Exception as e:
+            print(f"\n❌ ERROR processing {url}: {e}")
+            print("\n📋 Full traceback:")
+            traceback.print_exc()
+            all_results.append({
+                'url': url,
+                'key': url.split('key=')[1],
+                'records': 0,
+                'success': False,
+                'error': str(e)
+            })
+    
+    # Summary
+    print("\n" + "=" * 60)
+    print("📊 SUMMARY REPORT")
+    print("=" * 60)
+    successful = [r for r in all_results if r['success']]
+    failed = [r for r in all_results if not r['success']]
+    
+    print(f"✅ Successful downloads: {len(successful)}")
+    print(f"❌ Failed downloads: {len(failed)}")
+    print(f"📊 Total records saved: {total_records}")
+    
+    if successful:
+        print("\n📁 Downloaded files:")
+        for result in successful:
+            filename = get_filename_from_url(result['url'])
+            print(f"   - {filename} ({result['records']} records)")
+    
+    if failed:
+        print("\n❌ Failed URLs:")
+        for result in failed:
+            error_msg = result.get('error', 'Unknown error')
+            print(f"   - {result['url']} ({error_msg})")
     
     print("=" * 60)
+    return all_results
+
+if __name__ == "__main__":
+    try:
+        download_all()
+    except Exception as e:
+        print(f"\n❌ FATAL ERROR: {e}")
+        print("\n📋 Full traceback:")
+        traceback.print_exc()
