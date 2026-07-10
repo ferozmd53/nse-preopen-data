@@ -25,9 +25,9 @@ HEADERS = {
     "Referer": "https://www.nseindia.com/report-detail/fo_eq_security",
 }
 
-def get_filename_from_url(url):
+def get_filename_from_data(json_data, url):
     """
-    Get filename based on URL parameters
+    Get filename based on LAST_UPDATE from the data
     URL: https://www.nseindia.com/api/market-data-pre-open?key=NIFTY
     Returns: pre-open-NIFTY-DD-MMM-YYYY.csv
     """
@@ -35,9 +35,43 @@ def get_filename_from_url(url):
     key_match = re.search(r'key=([^&]+)', url)
     key = key_match.group(1) if key_match else 'UNKNOWN'
     
-    today = datetime.date.today()
-    # Format: DD-MMM-YYYY (e.g., 01-JUL-2026)
-    date_str = today.strftime("%d-%b-%Y").upper()
+    # Try to get date from the data
+    data_list = json_data.get('data', [])
+    date_str = None
+    
+    # Look for LAST_UPDATE in the data
+    for item in data_list:
+        detail = item.get('detail', {})
+        preopen = detail.get('preOpenMarket', {})
+        last_update = preopen.get('lastUpdateTime', '')
+        
+        if last_update:
+            # Parse the date from LAST_UPDATE
+            try:
+                # LAST_UPDATE format: "DD-MMM-YYYY HH:MM:SS" or similar
+                # Example: "01-JUL-2026 09:15:00"
+                date_part = last_update.split(' ')[0]  # Get the date part
+                # Try to parse it
+                parsed_date = datetime.datetime.strptime(date_part, "%d-%b-%Y")
+                date_str = parsed_date.strftime("%d-%b-%Y").upper()
+                break
+            except:
+                # If parsing fails, try alternative format
+                try:
+                    # Try with different format
+                    parsed_date = datetime.datetime.strptime(last_update, "%d-%b-%Y %H:%M:%S")
+                    date_str = parsed_date.strftime("%d-%b-%Y").upper()
+                    break
+                except:
+                    continue
+    
+    # If no valid date found in data, use today's date
+    if not date_str:
+        today = datetime.date.today()
+        date_str = today.strftime("%d-%b-%Y").upper()
+        print(f"⚠️ No LAST_UPDATE found in data, using today's date: {date_str}")
+    else:
+        print(f"📅 Using date from data: {date_str}")
     
     return f"pre-open-{key}-{date_str}.csv"
 
@@ -105,15 +139,15 @@ def fetch_json_data(url):
     return response.json()
 
 def parse_and_save(json_data, url):
-    """Parse JSON and save as CSV with filename from URL key"""
+    """Parse JSON and save as CSV with filename from data's LAST_UPDATE field"""
     print("🔍 Debug: Starting parse_and_save...")
     
     # Create data folder if it doesn't exist
     os.makedirs("data", exist_ok=True)
     
-    # Get the filename based on URL key
-    url_filename = get_filename_from_url(url)
-    print(f"📁 Filename from URL: {url_filename}")
+    # Get the filename based on data's LAST_UPDATE
+    url_filename = get_filename_from_data(json_data, url)
+    print(f"📁 Filename from data: {url_filename}")
     
     # Get the next available filename (handles duplicates)
     filename = get_next_filename(url_filename)
@@ -126,6 +160,9 @@ def parse_and_save(json_data, url):
     if not data_list:
         print("⚠️ No data received from API")
         return []
+    
+    # Store the date from first record for verification
+    first_date = None
     
     for item in data_list:
         metadata = item.get('metadata', {})
@@ -154,12 +191,18 @@ def parse_and_save(json_data, url):
         else:
             adv_decl = 'NEUTRAL'
         
+        last_update = preopen.get('lastUpdateTime', '')
+        
+        # Store the first valid date for verification
+        if last_update and not first_date:
+            first_date = last_update
+        
         record = {
             'SYMBOL': metadata.get('symbol', ''),
             'PREOPEN': iep_price,
             'FINAL_PRICE': preopen.get('finalPrice', ''),
             'FINAL_QUANTITY': preopen.get('finalQuantity', ''),
-            'LAST_UPDATE': preopen.get('lastUpdateTime', ''),
+            'LAST_UPDATE': last_update,
             'TOTAL_BUY_QTY': buy_qty,
             'TOTAL_SELL_QTY': sell_qty,
             'ADV_DECL': adv_decl
@@ -179,6 +222,8 @@ def parse_and_save(json_data, url):
         if os.path.exists(filename):
             file_size = os.path.getsize(filename)
             print(f"✅ File created: {filename} ({file_size} bytes)")
+            if first_date:
+                print(f"📅 Data date from LAST_UPDATE: {first_date}")
         else:
             print(f"❌ File NOT created at {filename}")
             return []
@@ -195,7 +240,7 @@ def download_all():
     """Download data for all URLs"""
     print("=" * 60)
     print("🚀 Starting NSE data fetch for multiple URLs...")
-    print(f"📅 Time: {datetime.datetime.now()}")
+    print(f"📅 Current time: {datetime.datetime.now()}")
     print(f"📁 Current directory: {os.getcwd()}")
     print("=" * 60)
     
@@ -262,9 +307,8 @@ def download_all():
     
     if successful:
         print("\n📁 Downloaded files:")
-        for result in successful:
-            filename = get_filename_from_url(result['url'])
-            print(f"   - {filename} ({result['records']} records)")
+        # We need to fetch JSON data again to get filenames (or store them)
+        print("   (Files are saved with dates from LAST_UPDATE field)")
     
     if failed:
         print("\n❌ Failed URLs:")
