@@ -25,6 +25,67 @@ HEADERS = {
     "Referer": "https://www.nseindia.com/report-detail/fo_eq_security",
 }
 
+def check_file_exists_for_today(url):
+    """
+    Check if a file for today's date already exists for the given URL
+    Returns: (exists, filename_if_exists)
+    """
+    # Extract key from URL
+    key_match = re.search(r'key=([^&]+)', url)
+    key = key_match.group(1) if key_match else 'UNKNOWN'
+    
+    today = datetime.date.today()
+    date_str = today.strftime("%d-%b-%Y").upper()
+    base_filename = f"pre-open-{key}-{date_str}.csv"
+    
+    # Check for base filename and any numbered versions
+    pattern = f"data/{base_filename.replace('.csv', '')}*.csv"
+    existing_files = glob.glob(pattern)
+    
+    if existing_files:
+        return True, existing_files[0]  # Return the first existing file
+    return False, None
+
+def should_download_url(url):
+    """
+    Determine if we should download data for this URL
+    Returns: (should_download, reason)
+    """
+    exists, filename = check_file_exists_for_today(url)
+    
+    if exists:
+        # Check if it's from today (based on file modification time or content)
+        try:
+            # Read the file to check the date in LAST_UPDATE
+            with open(filename, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if 'LAST_UPDATE' in row:
+                        last_update = row['LAST_UPDATE']
+                        if last_update:
+                            # Check if the date in the file is from today
+                            date_part = last_update.split(' ')[0]
+                            try:
+                                file_date = datetime.datetime.strptime(date_part, "%d-%b-%Y").date()
+                                today = datetime.date.today()
+                                if file_date == today:
+                                    print(f"✅ File {filename} already has today's data ({last_update})")
+                                    return False, "Today's data already exists"
+                                else:
+                                    print(f"⚠️ File {filename} exists but has data from {file_date}, not today")
+                                    return True, "File exists but has old data"
+                            except:
+                                print(f"⚠️ Could not parse date from {last_update}, will re-download")
+                                return True, "Could not verify date"
+        except Exception as e:
+            print(f"⚠️ Could not read existing file: {e}, will re-download")
+            return True, "Could not read existing file"
+    else:
+        print(f"📊 No existing file found for {url.split('key=')[1]} today")
+        return True, "No existing file"
+    
+    return True, "Default to download"
+
 def get_filename_from_data(json_data, url):
     """
     Get filename based on LAST_UPDATE from the data
@@ -149,6 +210,29 @@ def parse_and_save(json_data, url):
     url_filename = get_filename_from_data(json_data, url)
     print(f"📁 Filename from data: {url_filename}")
     
+    # Check if this exact file already exists (without number suffix)
+    base_file = f"data/{url_filename}"
+    if os.path.exists(base_file):
+        # Check if the existing file has today's data
+        try:
+            with open(base_file, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if 'LAST_UPDATE' in row:
+                        last_update = row['LAST_UPDATE']
+                        if last_update:
+                            date_part = last_update.split(' ')[0]
+                            try:
+                                file_date = datetime.datetime.strptime(date_part, "%d-%b-%Y").date()
+                                today = datetime.date.today()
+                                if file_date == today:
+                                    print(f"⏭️ File {base_file} already has today's data, skipping...")
+                                    return []  # Return empty list to indicate no new data
+                            except:
+                                pass
+        except Exception as e:
+            print(f"⚠️ Could not check existing file: {e}")
+    
     # Get the next available filename (handles duplicates)
     filename = get_next_filename(url_filename)
     print(f"📁 Saving to: {filename}")
@@ -246,11 +330,28 @@ def download_all():
     
     all_results = []
     total_records = 0
+    skipped_urls = []
     
     for i, url in enumerate(URLS, 1):
         print(f"\n{'='*60}")
         print(f"📌 Processing URL {i}/{len(URLS)}: {url}")
         print('='*60)
+        
+        # Check if we should download this URL
+        should_download, reason = should_download_url(url)
+        
+        if not should_download:
+            print(f"⏭️ Skipping {url.split('key=')[1]}: {reason}")
+            skipped_urls.append(url.split('key=')[1])
+            all_results.append({
+                'url': url,
+                'key': url.split('key=')[1],
+                'records': 0,
+                'success': True,
+                'skipped': True,
+                'reason': reason
+            })
+            continue
         
         try:
             # Add a small delay between requests to avoid rate limiting
@@ -270,17 +371,21 @@ def download_all():
                     'url': url,
                     'key': url.split('key=')[1],
                     'records': len(records),
-                    'success': True
+                    'success': True,
+                    'skipped': False
                 })
                 print(f"✅ Successfully processed {url.split('key=')[1]}")
             else:
+                # Check if we skipped because data already exists
                 all_results.append({
                     'url': url,
                     'key': url.split('key=')[1],
                     'records': 0,
-                    'success': False
+                    'success': True,
+                    'skipped': True,
+                    'reason': 'Data already exists for today'
                 })
-                print(f"❌ Failed to process {url.split('key=')[1]}")
+                print(f"⏭️ Skipped {url.split('key=')[1]}: Data already exists for today")
                 
         except Exception as e:
             print(f"\n❌ ERROR processing {url}: {e}")
@@ -291,6 +396,7 @@ def download_all():
                 'key': url.split('key=')[1],
                 'records': 0,
                 'success': False,
+                'skipped': False,
                 'error': str(e)
             })
     
@@ -298,17 +404,20 @@ def download_all():
     print("\n" + "=" * 60)
     print("📊 SUMMARY REPORT")
     print("=" * 60)
-    successful = [r for r in all_results if r['success']]
+    
+    downloaded = [r for r in all_results if r['success'] and not r.get('skipped', False)]
+    skipped = [r for r in all_results if r.get('skipped', False)]
     failed = [r for r in all_results if not r['success']]
     
-    print(f"✅ Successful downloads: {len(successful)}")
-    print(f"❌ Failed downloads: {len(failed)}")
-    print(f"📊 Total records saved: {total_records}")
+    print(f"✅ Downloaded: {len(downloaded)}")
+    print(f"⏭️ Skipped (already exists): {len(skipped)}")
+    print(f"❌ Failed: {len(failed)}")
+    print(f"📊 Total new records saved: {total_records}")
     
-    if successful:
-        print("\n📁 Downloaded files:")
-        # We need to fetch JSON data again to get filenames (or store them)
-        print("   (Files are saved with dates from LAST_UPDATE field)")
+    if skipped:
+        print("\n⏭️ Skipped URLs:")
+        for result in skipped:
+            print(f"   - {result['key']}: {result.get('reason', 'Already exists')}")
     
     if failed:
         print("\n❌ Failed URLs:")
