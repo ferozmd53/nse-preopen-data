@@ -53,7 +53,7 @@ from NorenRestApiPy.NorenApi import NorenApi
 # ============================================================
 # CONFIGURATION - Hardcoded symbol
 # ============================================================
-WORKBOOK_NAME = "Nifty_OptionChain.xlsx"
+WORKBOOK_NAME = "shoonya_OptionChain.xlsx"
 SYMBOL = "NIFTY"  # Hardcoded symbol
 EXCHANGE = "NFO"
 SPOT_EXCHANGE = "NSE"
