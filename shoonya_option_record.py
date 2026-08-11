@@ -1,3 +1,4 @@
+# CANDLE COLUMN ORDER: Call Change OI is beside Call OI; Put Change OI is beside Put OI.
 import os
 import sys
 import time
@@ -450,14 +451,15 @@ def get_or_create_workbook():
         headers = [
             "Feed Time", "Request Time", "Last Traded Time",
             "Spot", "ATM Strike",
-            "OTM Call Strike", "Call IV", "Call OI",
+            "OTM Call Strike", "Call IV", "Call OI", "Call Change OI",
             "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
             "Call Bid", "Call Ask", "Call Bid-Ask Diff",
-            "OTM Put Strike", "Put IV", "Put OI",
+            "OTM Put Strike", "Put IV", "Put OI", "Put Change OI",
             "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
-            "Put Bid", "Put Ask", "Put Bid-Ask Diff"
+            "Put Bid", "Put Ask", "Put Bid-Ask Diff",
+            "PCR OI", "PCR Change OI"
         ]
-        history_sheet.range("A1:W1").value = headers
+        history_sheet.range("A1:AA1").value = headers
         history_sheet.range("B:B").number_format = "yyyy-mm-dd hh:mm:ss"
         tick_counter = 0
     else:
@@ -470,21 +472,30 @@ def get_or_create_workbook():
                 headers = [
                     "Feed Time", "Request Time", "Last Traded Time",
                     "Spot", "ATM Strike",
-                    "OTM Call Strike", "Call IV", "Call OI",
+                    "OTM Call Strike", "Call IV", "Call OI", "Call Change OI",
                     "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
                     "Call Bid", "Call Ask", "Call Bid-Ask Diff",
-                    "OTM Put Strike", "Put IV", "Put OI",
+                    "OTM Put Strike", "Put IV", "Put OI", "Put Change OI",
                     "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
-                    "Put Bid", "Put Ask", "Put Bid-Ask Diff"
+                    "Put Bid", "Put Ask", "Put Bid-Ask Diff",
+                    "PCR OI", "PCR Change OI"
                 ]
-                history_sheet.range("A1:W1").value = headers
+                history_sheet.range("A1:AA1").value = headers
                 history_sheet.range("B:B").number_format = "yyyy-mm-dd hh:mm:ss"
         except Exception as e:
             print(f"⚠️ Error checking headers: {e}")
 
+    # Always keep the Tick_History header structure current.
+    # This does not rewrite or delete existing tick data.
+    try:
+        history_sheet.range("A1:AA1").value = headers
+        history_sheet.range("B:B").number_format = "yyyy-mm-dd hh:mm:ss"
+    except Exception as e:
+        print(f"⚠️ Could not refresh Tick_History headers: {e}")
+
     # Count existing rows in Tick_History
     try:
-        history_last_row = history_sheet.used_range.last_cell.row
+        history_last_row = get_last_actual_row(history_sheet, "A", 1)
         tick_counter = max(0, history_last_row - 1) if history_last_row >= 2 else 0
         print(f"📚 Existing Tick_History rows: {tick_counter}")
     except Exception:
@@ -497,10 +508,11 @@ def get_or_create_workbook():
         # Create headers for new candle sheet with IV
         candle_headers = [
             "Time", "Close",
-            "Call Strike", "Call IV", "Call OI", "Call Bid-Ask Avg", 
+            "Call Strike", "Call IV", "Call OI", "Call Change OI", "Call Bid-Ask Avg",
             "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
-            "Put Strike", "Put IV", "Put OI", "Put Bid-Ask Avg",
+            "Put Strike", "Put IV", "Put OI", "Put Change OI", "Put Bid-Ask Avg",
             "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
+            "PCR OI", "PCR Change OI",
             "Ticks"
         ]
         candle_sheet.range("A2").value = candle_headers
@@ -517,9 +529,11 @@ def get_or_create_workbook():
                     "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
                     "Put Strike", "Put IV", "Put OI", "Put Bid-Ask Avg",
                     "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
+                    "Call Change OI", "Put Change OI",
+                    "PCR OI", "PCR Change OI",
                     "Ticks"
                 ]
-                candle_sheet.range("A2").value = candle_headers
+                candle_sheet.range("A2:U2").value = [candle_headers]
         except Exception:
             pass
         candle_sheet.range("A1").value = f"{AGGREGATION_INTERVAL}-Minute Candle Data"
@@ -529,6 +543,15 @@ def get_or_create_workbook():
             wb.sheets["Sheet1"].delete()
     except Exception:
         pass
+
+    # IMPORTANT: physically migrate old Candles data once.
+    # This fixes existing rows where Call Change OI was stored in Q.
+    fix_candle_column_order(candle_sheet)
+
+    print(
+        f"📍 Real Tick_History last row: {get_last_actual_row(history_sheet, 'A', 1)} | "
+        f"Real Candles last row: {get_last_actual_row(candle_sheet, 'A', 2)}"
+    )
 
     wb.save()
     return wb, login_sheet, oc_sheet, history_sheet, candle_sheet
@@ -543,13 +566,12 @@ def check_tick_history_status(history_sheet):
         print("🔍 Checking Tick_History status...")
         
         # Check if sheet exists
-        used_range = history_sheet.used_range
-        last_row = used_range.last_cell.row
+        last_row = get_last_actual_row(history_sheet, "A", 1)
         print(f"   Used range rows: {last_row}")
         
         if last_row >= 1:
             # Check headers
-            headers = history_sheet.range("A1:W1").value
+            headers = history_sheet.range("A1:Z1").value
             if headers and any(headers):
                 print(f"   Headers found: {headers[0] if headers else 'None'}")
             else:
@@ -557,7 +579,7 @@ def check_tick_history_status(history_sheet):
         
         # Check if there's data in row 2
         if last_row >= 2:
-            row2_data = history_sheet.range("A2:W2").value
+            row2_data = history_sheet.range("A2:Z2").value
             if row2_data and any(row2_data):
                 print(f"   Data found in row 2: {row2_data[0] if row2_data else 'None'}")
             else:
@@ -648,13 +670,12 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         # We still read history to calculate the current candle,
         # but we NEVER write historical candle rows again.
         # ------------------------------------------------------------
-        used_range = history_sheet.used_range
-        last_row = used_range.last_cell.row
+        last_row = get_last_actual_row(history_sheet, "A", 1)
 
         if last_row < 2:
             return 0
 
-        values = history_sheet.range(f"A1:W{last_row}").value
+        values = history_sheet.range(f"A1:AA{last_row}").value
         if not values or len(values) < 2:
             return 0
 
@@ -663,10 +684,10 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         df = pd.DataFrame(data_rows, columns=headers)
 
         required = [
-            "Request Time", "Spot", "OTM Call Strike", "Call IV", "Call OI",
+            "Request Time", "Spot", "OTM Call Strike", "Call IV", "Call OI", "Call Change OI",
             "Call Total Buy", "Call Total Sell", "Call Bid", "Call Ask",
-            "OTM Put Strike", "Put IV", "Put OI", "Put Total Buy",
-            "Put Total Sell", "Put Bid", "Put Ask"
+            "OTM Put Strike", "Put IV", "Put OI", "Put Change OI", "Put Total Buy",
+            "Put Total Sell", "Put Bid", "Put Ask", "PCR OI", "PCR Change OI"
         ]
 
         missing = [c for c in required if c not in df.columns]
@@ -680,10 +701,10 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         df["datetime"] = df["Request Time"].apply(_parse_tick_datetime)
 
         numeric_cols = [
-            "Spot", "OTM Call Strike", "Call IV", "Call OI",
+            "Spot", "OTM Call Strike", "Call IV", "Call OI", "Call Change OI",
             "Call Total Buy", "Call Total Sell", "Call Bid", "Call Ask",
-            "OTM Put Strike", "Put IV", "Put OI", "Put Total Buy",
-            "Put Total Sell", "Put Bid", "Put Ask"
+            "OTM Put Strike", "Put IV", "Put OI", "Put Change OI", "Put Total Buy",
+            "Put Total Sell", "Put Bid", "Put Ask", "PCR OI", "PCR Change OI"
         ]
 
         for col in numeric_cols:
@@ -771,6 +792,7 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
             float(last["OTM Call Strike"]),
             float(last["Call IV"]),
             float(current_group["Call OI"].mean()),
+            float(last["Call Change OI"]),
             float(call_bid_ask),
             float(call_buy),
             float(call_sell),
@@ -778,10 +800,13 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
             float(last["OTM Put Strike"]),
             float(last["Put IV"]),
             float(current_group["Put OI"].mean()),
+            float(last["Put Change OI"]),
             float(put_bid_ask),
             float(put_buy),
             float(put_sell),
             float(put_buy - put_sell),
+            float(last["PCR OI"]),
+            float(last["PCR Change OI"]),
             int(len(current_group)),
         ]
 
@@ -800,16 +825,17 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
             candle_sheet.range("A1").value = candle_title
 
         candle_headers = [
-            "Time", "Close",
-            "Call Strike", "Call IV", "Call OI", "Call Bid-Ask Avg",
+"Time", "Close",
+            "Call Strike", "Call IV", "Call OI", "Call Change OI", "Call Bid-Ask Avg",
             "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
-            "Put Strike", "Put IV", "Put OI", "Put Bid-Ask Avg",
+            "Put Strike", "Put IV", "Put OI", "Put Change OI", "Put Bid-Ask Avg",
             "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
+            "PCR OI", "PCR Change OI",
             "Ticks"
         ]
 
         try:
-            current_headers = candle_sheet.range("A2:Q2").value
+            current_headers = candle_sheet.range("A2:U2").value
             if current_headers and isinstance(current_headers, list):
                 if len(current_headers) == 1 and isinstance(
                     current_headers[0], list
@@ -819,7 +845,7 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
             current_headers = None
 
         if current_headers != candle_headers:
-            candle_sheet.range("A2:Q2").value = [candle_headers]
+            candle_sheet.range("A2:U2").value = [candle_headers]
 
         # ------------------------------------------------------------
         # FIND ONLY THE LAST CANDLE ROW
@@ -828,7 +854,7 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         # Only the latest row matters.
         # ------------------------------------------------------------
         try:
-            candle_last_row = candle_sheet.used_range.last_cell.row
+            candle_last_row = get_last_actual_row(candle_sheet, "A", 2)
         except Exception:
             candle_last_row = 2
 
@@ -837,11 +863,11 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
             target_row = 3
 
             candle_sheet.range(
-                f"A{target_row}:Q{target_row}"
+                f"A{target_row}:U{target_row}"
             ).value = [new_values]
 
             candle_sheet.range(
-                f"B{target_row}:P{target_row}"
+                f"B{target_row}:S{target_row}"
             ).number_format = "#,##0.00"
 
             print(
@@ -854,7 +880,7 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         # READ ONLY THE LAST ROW
         # ------------------------------------------------------------
         last_row_values = candle_sheet.range(
-            f"A{candle_last_row}:Q{candle_last_row}"
+            f"A{candle_last_row}:U{candle_last_row}"
         ).value
 
         if last_row_values and isinstance(last_row_values, list):
@@ -987,11 +1013,11 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
 
             # One row ONLY.
             candle_sheet.range(
-                f"A{candle_last_row}:Q{candle_last_row}"
+                f"A{candle_last_row}:U{candle_last_row}"
             ).value = [new_values]
 
             candle_sheet.range(
-                f"B{candle_last_row}:P{candle_last_row}"
+                f"B{candle_last_row}:S{candle_last_row}"
             ).number_format = "#,##0.00"
 
             print(
@@ -1008,11 +1034,11 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         target_row = candle_last_row + 1
 
         candle_sheet.range(
-            f"A{target_row}:Q{target_row}"
+            f"A{target_row}:U{target_row}"
         ).value = [new_values]
 
         candle_sheet.range(
-            f"B{target_row}:P{target_row}"
+            f"B{target_row}:S{target_row}"
         ).number_format = "#,##0.00"
 
         print(
@@ -1029,6 +1055,193 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         import traceback
         traceback.print_exc()
         return 0
+
+
+
+
+# ----------------------------------------------------------------------
+# FIND LAST REAL DATA ROW
+# ----------------------------------------------------------------------
+def get_last_actual_row(sheet, column="A", header_row=1):
+    """
+    Returns the last row containing REAL content in the specified column.
+
+    IMPORTANT:
+    Do NOT use sheet.get_last_actual_row(...) for data positioning.
+    Excel's used range can include old formatting, colors, borders, etc.
+    That can create huge blank gaps such as writing Candles at row 274
+    or Tick_History at row 1344.
+
+    Column A is used because:
+      Tick_History -> Feed Time is column A
+      Candles      -> Time is column A
+    """
+    try:
+        max_row = sheet.cells.last_cell.row
+        last = sheet.range(f"{column}{max_row}").end("up").row
+
+        # Never return a row above the header.
+        return max(int(last), int(header_row))
+    except Exception:
+        return int(header_row)
+
+
+# ----------------------------------------------------------------------
+# FIX / MIGRATE EXISTING CANDLES SHEET
+# ----------------------------------------------------------------------
+def fix_candle_column_order(candle_sheet):
+    """
+    IMPORTANT:
+    Older versions stored Call Change OI in Q and Put Change OI in R.
+
+    Old layout:
+    A Time
+    B Close
+    C Call Strike
+    D Call IV
+    E Call OI
+    F Call Bid-Ask Avg
+    G Call Total Buy
+    H Call Total Sell
+    I Call Buy-Sell Diff
+    J Put Strike
+    K Put IV
+    L Put OI
+    M Put Bid-Ask Avg
+    N Put Total Buy
+    O Put Total Sell
+    P Put Buy-Sell Diff
+    Q Call Change OI
+    R Put Change OI
+    S PCR OI
+    T PCR Change OI
+    U Ticks
+
+    New layout:
+    A Time
+    B Close
+    C Call Strike
+    D Call IV
+    E Call OI
+    F Call Change OI
+    G Call Bid-Ask Avg
+    H Call Total Buy
+    I Call Total Sell
+    J Call Buy-Sell Diff
+    K Put Strike
+    L Put IV
+    M Put OI
+    N Put Change OI
+    O Put Bid-Ask Avg
+    P Put Total Buy
+    Q Put Total Sell
+    R Put Buy-Sell Diff
+    S PCR OI
+    T PCR Change OI
+    U Ticks
+
+    This physically moves the EXISTING rows. Changing only the header
+    does not fix old data, which was the source of the user's problem.
+    """
+    headers = [
+        "Time", "Close",
+        "Call Strike", "Call IV", "Call OI", "Call Change OI",
+        "Call Bid-Ask Avg", "Call Total Buy", "Call Total Sell",
+        "Call Buy-Sell Diff",
+        "Put Strike", "Put IV", "Put OI", "Put Change OI",
+        "Put Bid-Ask Avg", "Put Total Buy", "Put Total Sell",
+        "Put Buy-Sell Diff", "PCR OI", "PCR Change OI", "Ticks"
+    ]
+
+    try:
+        last_row = get_last_actual_row(candle_sheet, "A", 2)
+        if last_row < 2:
+            candle_sheet.range("A2:U2").value = [headers]
+            return
+
+        raw = candle_sheet.range(f"A2:U{last_row}").value
+        if not raw:
+            candle_sheet.range("A2:U2").value = [headers]
+            return
+
+        # Flatten one-row return if xlwings gives it that way.
+        if isinstance(raw, list) and raw and not isinstance(raw[0], list):
+            raw = [raw]
+
+        first = raw[0] if raw else []
+        first_norm = [str(x).strip() if x is not None else "" for x in first]
+
+        new_norm = [str(x) for x in headers]
+
+        # Detect the OLD layout by its exact identifying positions.
+        old_layout = (
+            len(first_norm) >= 21 and
+            first_norm[4] == "Call OI" and
+            first_norm[5] == "Call Bid-Ask Avg" and
+            first_norm[15] == "Put Buy-Sell Diff" and
+            first_norm[16] == "Call Change OI" and
+            first_norm[17] == "Put Change OI"
+        )
+
+        # Detect whether row 2 is already the new header.
+        already_new = first_norm[:21] == new_norm
+
+        if old_layout:
+            print("🔧 Migrating existing Candles columns: Q→F and R→N...")
+
+            old_data = raw[1:]  # exclude old header
+
+            migrated = []
+            for row in old_data:
+                row = list(row) + [None] * (21 - len(row))
+                migrated.append([
+                    row[0],   # A Time
+                    row[1],   # B Close
+                    row[2],   # C Call Strike
+                    row[3],   # D Call IV
+                    row[4],   # E Call OI
+                    row[16],  # F Call Change OI  <-- OLD Q
+                    row[5],   # G Call Bid-Ask Avg
+                    row[6],   # H Call Total Buy
+                    row[7],   # I Call Total Sell
+                    row[8],   # J Call Buy-Sell Diff
+                    row[9],   # K Put Strike
+                    row[10],  # L Put IV
+                    row[11],  # M Put OI
+                    row[17],  # N Put Change OI  <-- OLD R
+                    row[12],  # O Put Bid-Ask Avg
+                    row[13],  # P Put Total Buy
+                    row[14],  # Q Put Total Sell
+                    row[15],  # R Put Buy-Sell Diff
+                    row[18],  # S PCR OI
+                    row[19],  # T PCR Change OI
+                    row[20],  # U Ticks
+                ])
+
+            # Clear and rewrite ONLY the Candles table once, during startup
+            # migration. Normal live refreshes never rewrite old rows.
+            candle_sheet.range(f"A2:U{last_row}").clear_contents()
+            candle_sheet.range("A2:U2").value = [headers]
+
+            if migrated:
+                candle_sheet.range(
+                    f"A3:U{2 + len(migrated)}"
+                ).value = migrated
+
+            print(
+                f"✅ Candles migration complete: {len(migrated)} historical rows fixed."
+            )
+            return
+
+        if not already_new:
+            # New sheet or unusual header: set the correct header.
+            candle_sheet.range("A2:U2").value = [headers]
+            print("✅ Candles header set to corrected order.")
+        else:
+            print("✅ Candles column order already correct.")
+
+    except Exception as e:
+        print(f"⚠️ Candles column migration error: {e}")
 
 
 # ----------------------------------------------------------------------
@@ -1428,32 +1641,37 @@ def dump_available_expiries(oc_sheet):
 # ATM HIGHLIGHT - GREEN BACKGROUND
 # ============================================================
 def apply_atm_highlight(oc_sheet, atm_strike):
+    """Highlight the ATM row in the OptionChain data area.
+
+    OptionChain headers are on row 10 and data starts on row 11.
+    The highlight extends across all 27 displayed columns (A:AA).
+    """
     try:
-        oc_sheet.range("A6:V1000").color = None
-        
-        data = oc_sheet.range("A6:V1000").value
-        if not data:
+        # Clear only the displayed OptionChain data area.
+        oc_sheet.range("A11:AA1000").color = None
+
+        data = oc_sheet.range("A11:AA1000").value
+        if not data or not isinstance(data, list):
             return
-        
-        if not isinstance(data, list) or not data:
-            return
-        
+
         for i, row in enumerate(data):
-            if row and len(row) > 4:
-                # Displayed sheet columns (0-indexed): 5=Call Strike, 13=Put Strike
-                call_strike = convert_to_float(row[5]) if len(row) > 5 else None
-                put_strike = convert_to_float(row[13]) if len(row) > 13 else None
-                
-                if (call_strike is not None and abs(call_strike - atm_strike) < 0.01) or \
-                   (put_strike is not None and abs(put_strike - atm_strike) < 0.01):
-                    row_num = i + 6
-                    oc_sheet.range(f"A{row_num}:V{row_num}").color = (0, 255, 0)
-                    print(f"✅ ATM Highlight applied to row {row_num} (ATM Strike: {atm_strike})")
-                    break
-                    
+            if not row:
+                continue
+
+            # OptionChain columns:
+            # F = Call Strike, P = Put Strike (1-based Excel columns)
+            call_strike = convert_to_float(row[5]) if len(row) > 5 else None
+            put_strike = convert_to_float(row[15]) if len(row) > 15 else None
+
+            if ((call_strike is not None and abs(call_strike - atm_strike) < 0.01) or
+                (put_strike is not None and abs(put_strike - atm_strike) < 0.01)):
+                row_num = i + 11
+                oc_sheet.range(f"A{row_num}:AA{row_num}").color = (0, 255, 0)
+                print(f"✅ ATM Highlight applied to row {row_num} (ATM Strike: {atm_strike})")
+                break
+
     except Exception as e:
         print(f"⚠️ ATM highlight error: {e}")
-
 
 # ----------------------------------------------------------------------
 # Function to get first OTM Call and Put strikes
@@ -1606,12 +1824,24 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
         # duplicate signature because they naturally change each refresh.
         # Everything from Spot through Put Bid-Ask Diff is compared.
         # ------------------------------------------------------------
+        # PCR is calculated ONLY for the selected OTM strikes in this row.
+        # PCR OI        = OTM Put OI / OTM Call OI
+        # PCR Change OI = OTM Put Change OI / OTM Call Change OI
+        call_oi = convert_to_float(call_data.get("CE_oi", 0))
+        put_oi = convert_to_float(put_data.get("PE_oi", 0))
+        call_chg_oi = convert_to_float(call_data.get("CE_coi", 0))
+        put_chg_oi = convert_to_float(put_data.get("PE_coi", 0))
+
+        pcr_oi = (put_oi / call_oi) if call_oi != 0 else 0.0
+        pcr_change_oi = (put_chg_oi / call_chg_oi) if call_chg_oi != 0 else 0.0
+
         market_values = [
             convert_to_float(spot_ltp),
             convert_to_float(atm_strike),
             convert_to_float(otm_call_strike),
             call_iv,
             convert_to_float(call_data.get("CE_oi", 0)),
+            convert_to_float(call_data.get("CE_coi", 0)),
             convert_to_float(call_data.get("CE_total_buy", 0)),
             convert_to_float(call_data.get("CE_total_sell", 0)),
             convert_to_float(call_data.get("CE_total_buy", 0)) -
@@ -1623,6 +1853,7 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
             convert_to_float(otm_put_strike),
             put_iv,
             convert_to_float(put_data.get("PE_oi", 0)),
+            convert_to_float(put_data.get("PE_coi", 0)),
             convert_to_float(put_data.get("PE_total_buy", 0)),
             convert_to_float(put_data.get("PE_total_sell", 0)),
             convert_to_float(put_data.get("PE_total_buy", 0)) -
@@ -1631,6 +1862,8 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
             convert_to_float(put_data.get("PE_sp1", 0)),
             convert_to_float(put_data.get("PE_sp1", 0)) -
             convert_to_float(put_data.get("PE_bp1", 0)),
+            pcr_oi,
+            pcr_change_oi,
         ]
 
         # ------------------------------------------------------------
@@ -1660,21 +1893,22 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
         headers = [
             "Feed Time", "Request Time", "Last Traded Time",
             "Spot", "ATM Strike",
-            "OTM Call Strike", "Call IV", "Call OI",
+            "OTM Call Strike", "Call IV", "Call OI", "Call Change OI",
             "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
             "Call Bid", "Call Ask", "Call Bid-Ask Diff",
-            "OTM Put Strike", "Put IV", "Put OI",
+            "OTM Put Strike", "Put IV", "Put OI", "Put Change OI",
             "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
-            "Put Bid", "Put Ask", "Put Bid-Ask Diff"
+            "Put Bid", "Put Ask", "Put Bid-Ask Diff",
+            "PCR OI", "PCR Change OI"
         ]
 
         # Ensure headers exist.
         try:
             if history_sheet.range("A1").value != "Feed Time":
-                history_sheet.range("A1:W1").value = headers
+                history_sheet.range("A1:AA1").value = headers
                 history_sheet.range("B:B").number_format = "yyyy-mm-dd hh:mm:ss"
         except Exception:
-            history_sheet.range("A1:W1").value = headers
+            history_sheet.range("A1:Z1").value = headers
 
         row_data = [
             feed_time,
@@ -1687,14 +1921,14 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
         # APPEND EXACTLY ONE NEW ROW
         # ------------------------------------------------------------
         try:
-            last_row = history_sheet.used_range.last_cell.row
+            last_row = get_last_actual_row(history_sheet, "A", 1)
             next_row = max(2, last_row + 1)
         except Exception:
             next_row = tick_counter + 2
 
-        history_sheet.range(f"A{next_row}:W{next_row}").value = row_data
+        history_sheet.range(f"A{next_row}:AA{next_row}").value = row_data
         history_sheet.range(f"B{next_row}").number_format = "yyyy-mm-dd hh:mm:ss"
-        history_sheet.range(f"D{next_row}:W{next_row}").number_format = "#,##0.00"
+        history_sheet.range(f"D{next_row}:AA{next_row}").number_format = "#,##0.00"
 
         tick_counter += 1
         last_tick_signature = signature
@@ -1733,7 +1967,7 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
 
     pre_expiry = None
     pre_no_of_strike = None
-    refresh_rate = 3
+    refresh_rate = 1
     last_aggregation_time = None
     
     # Check Tick_History status at startup
@@ -1760,7 +1994,7 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                 continue
 
             no_of_strike = int(oc_sheet.range("B2").value or NUMBER_OF_STRIKES)
-            refresh_rate = int(oc_sheet.range("B3").value or 3)
+            refresh_rate = int(oc_sheet.range("B3").value or 1)
 
             if not expiry_input:
                 time.sleep(1)
@@ -1900,6 +2134,7 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                 "Call Strike": df_display["strike"],
                 "Call IV": call_iv_list,
                 "Call OI": df_display["CE_oi"],
+                "Call Change OI": df_display["CE_coi"],
                 "Call Total Buy": df_display["CE_total_buy"],
                 "Call Total Sell": df_display["CE_total_sell"],
                 "Call Buy-Sell Diff": df_display["CE_total_buy"] - df_display["CE_total_sell"],
@@ -1909,19 +2144,32 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                 "Put Strike": df_display["strike"],
                 "Put IV": put_iv_list,
                 "Put OI": df_display["PE_oi"],
+                "Put Change OI": df_display["PE_coi"],
                 "Put Total Buy": df_display["PE_total_buy"],
                 "Put Total Sell": df_display["PE_total_sell"],
                 "Put Buy-Sell Diff": df_display["PE_total_buy"] - df_display["PE_total_sell"],
                 "Put Bid": df_display["PE_bp1"],
                 "Put Ask": df_display["PE_sp1"],
                 "Put Bid-Ask Diff": df_display["PE_sp1"] - df_display["PE_bp1"],
+                "PCR OI": np.where(
+                    pd.to_numeric(df_display["CE_oi"], errors="coerce").fillna(0) != 0,
+                    pd.to_numeric(df_display["PE_oi"], errors="coerce").fillna(0) /
+                    pd.to_numeric(df_display["CE_oi"], errors="coerce").fillna(0),
+                    0.0
+                ),
+                "PCR Change OI": np.where(
+                    pd.to_numeric(df_display["CE_coi"], errors="coerce").fillna(0) != 0,
+                    pd.to_numeric(df_display["PE_coi"], errors="coerce").fillna(0) /
+                    pd.to_numeric(df_display["CE_coi"], errors="coerce").fillna(0),
+                    0.0
+                ),
             })
 
             if pre_expiry != expiry_input or pre_no_of_strike != no_of_strike:
-                oc_sheet.range("A6:V1000").value = None
+                oc_sheet.range("A11:AA1000").value = None
                 pre_expiry, pre_no_of_strike = expiry_input, no_of_strike
 
-            oc_sheet.range("A5").options(index=False, header=True).value = df_final
+            oc_sheet.range("A10").options(index=False, header=True).value = df_final
             
             apply_atm_highlight(oc_sheet, atm_strike)
             
