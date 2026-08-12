@@ -1,4 +1,4 @@
-# CANDLE COLUMN ORDER: Call Change OI is beside Call OI; Put Change OI is beside Put OI.
+
 import os
 import sys
 import time
@@ -54,7 +54,7 @@ from NorenRestApiPy.NorenApi import NorenApi
 # ============================================================
 # CONFIGURATION - Hardcoded symbol
 # ============================================================
-WORKBOOK_NAME = "shoonya_OptionChain.xlsx"
+WORKBOOK_NAME = "STRIKE_OPTION.xlsx"
 SYMBOL = "NIFTY"  # Hardcoded symbol
 EXCHANGE = "NFO"
 SPOT_EXCHANGE = "NSE"
@@ -66,7 +66,7 @@ AGGREGATION_INTERVAL = 1  # Default candle interval in minutes
 
 # Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
-MARKET_START = 9 * 60 + 15  # 9:15 AM in minutes
+MARKET_START = 9 * 60 + 14  # 9:15 AM in minutes
 MARKET_END = 15 * 60 + 30   # 3:30 PM in minutes
 
 live_data = {}
@@ -427,7 +427,7 @@ def get_or_create_workbook():
         oc_sheet.range("A3").value = "RefreshRate(sec) =>"
         oc_sheet.range("A4").value = "Aggregation Interval (min) =>"
         oc_sheet.range("B2").value = NUMBER_OF_STRIKES
-        oc_sheet.range("B3").value = 3
+        oc_sheet.range("B3").value = 1
         oc_sheet.range("B4").value = AGGREGATION_INTERVAL
         oc_sheet.range("C1").value = "Available expiries -->"
         oc_sheet.range("G1").value = f"Symbol: {SYMBOL}"
@@ -1415,111 +1415,227 @@ def get_auth_code_via_selenium(client_id, user_id, password, totp_secret):
 # ----------------------------------------------------------------------
 # OAuth login with existing token check
 # ----------------------------------------------------------------------
-def shoonya_login(login_sheet):
-    global api
-    
-    login_data = get_all_login_data(login_sheet)
-    
-    if login_data['auth_code'] and login_data['token'] and login_data['usertoken']:
-        print("✅ Found existing auth code and tokens in Login sheet!")
-        print(f"   Auth Code: {login_data['auth_code'][:20]}...")
-        print(f"   Token: {login_data['token'][:20]}...")
-        print(f"   UserToken: {login_data['usertoken'][:20]}...")
-        
-        print("   Validating token...")
-        is_valid, reason = is_token_valid(login_data)
-        
-        if is_valid:
-            print(f"   ✅ Token is valid: {reason}")
-            
-            try:
-                class ShoonyaApiPy(NorenApi):
-                    def __init__(self):
-                        super().__init__(
-                            host="https://api.shoonya.com/NorenWClientAPI/",
-                            websocket="wss://api.shoonya.com/NorenWSAPI/",
-                        )
-                
-                api = ShoonyaApiPy()
-                api.uid = login_data['usertoken']
-                api.token = login_data['token']
-                api.actid = login_data['user_id']
-                
-                login_sheet.range("C2").value = f"Using existing tokens - {login_data['user_id']}"
-                print(f"✅ Using existing tokens for user: {login_data['user_id']}")
-                return True
-                
-            except Exception as e:
-                print(f"⚠️ Failed to use existing tokens: {e}")
-                print("   Will proceed with fresh login...")
-        else:
-            print(f"   ❌ Token invalid: {reason}")
-            print("   Will proceed with fresh login...")
-    else:
-        print("🔄 No valid tokens found. Proceeding with full login...")
-    
-    print("-" * 50)
-    print("🔄 Performing fresh login...")
-    
-    if not login_data['user_id'] or not login_data['password'] or not login_data['totp_secret'] or not login_data['secret_code']:
-        login_sheet.range("C2").value = "Missing credentials! Check B2:B5"
-        print("❌ Missing credentials in Login sheet!")
-        return False
-
-    print(f"✅ Found credentials:")
-    print(f"   User ID: {login_data['user_id']}")
-    print(f"   Client ID: {login_data['client_id']}")
-
+def _make_api():
+    """Create a clean Shoonya OAuth API object."""
     class ShoonyaApiPy(NorenApi):
         def __init__(self):
             super().__init__(
                 host="https://api.shoonya.com/NorenWClientAPI/",
                 websocket="wss://api.shoonya.com/NorenWSAPI/",
             )
+    return ShoonyaApiPy()
 
-    api = ShoonyaApiPy()
 
-    login_sheet.range("C2").value = "Fetching auth code via browser login..."
-    print("   Opening browser for login...")
-    auth_code = get_auth_code_via_selenium(
-        login_data['client_id'], 
-        login_data['user_id'], 
-        login_data['password'], 
-        login_data['totp_secret']
-    )
-    
-    if not auth_code:
-        login_sheet.range("C2").value = "Failed to retrieve auth code"
-        print("❌ Failed to retrieve auth code")
-        return False
+def _install_oauth_session(api_obj, uid, token, actid):
+    """
+    Restore BOTH the normal Noren identity fields and the OAuth HTTP
+    Authorization header.  The latter is important for the OAuth
+    WebSocket flow.
+    """
+    api_obj.uid = uid
+    api_obj.token = token
+    api_obj.actid = actid
 
-    print(f"   Auth code obtained: {auth_code[:20]}...")
-    print("   Getting access token...")
-    
-    result = api.getAccessToken(
-        auth_code, 
-        login_data['secret_code'], 
-        login_data['client_id'], 
-        login_data['user_id']
-    )
-    
-    if result is None:
-        login_sheet.range("C2").value = "Failed to retrieve access token"
-        print("❌ Failed to retrieve access token")
+    try:
+        header = api_obj.injectOAuthHeader(token)
+        print("   ✅ OAuth HTTP header/session restored")
+        return header
+    except Exception as e:
+        print(f"   ⚠️ injectOAuthHeader() failed: {e}")
+        return None
+
+
+def _apply_access_token_result(api_obj, result, login_sheet, auth_code):
+    """Save and install a successful getAccessToken() result."""
+    if not result or not isinstance(result, (tuple, list)) or len(result) < 4:
         return False
 
     acc_tok, usrid, ref_tok, actid = result
-    
+
+    if not acc_tok or not usrid:
+        return False
+
+    _install_oauth_session(api_obj, usrid, acc_tok, actid)
+
     update_login_data(login_sheet, auth_code, acc_tok, usrid)
-    
+
     login_sheet.range("C2").value = f"Login OK - {usrid}"
     print(f"✅ Login successful! User: {usrid}")
-    print(f"   Auth Code saved to Excel: {auth_code[:20]}...")
-    print(f"   Token saved to Excel: {acc_tok[:20]}...")
-    print(f"   UserToken saved to Excel: {usrid[:20]}...")
-    print(f"   Token timestamp saved to Excel")
-    
+    print(f"   Auth Code saved: {str(auth_code)[:20]}...")
+    print(f"   Token saved: {str(acc_tok)[:20]}...")
+    print(f"   UserToken saved: {str(usrid)[:20]}...")
+    print("   Token timestamp saved to Excel")
     return True
+
+
+def shoonya_login(login_sheet):
+    """
+    Login/re-login policy:
+
+    1. Try SAVED ACCESS TOKEN first.
+    2. If saved token cannot be used, try the AUTH CODE already stored
+       in Login!  NO browser login at this stage.
+    3. If getAccessToken(auth_code, ...) returns None, treat that saved
+       AUTH CODE as expired/invalid and ONLY THEN perform a fresh browser
+       OAuth login.
+    4. If fresh browser OAuth returns an auth code, exchange it for a token.
+    5. Never stop merely because the saved auth code returned None.
+    """
+    global api
+
+    login_data = get_all_login_data(login_sheet)
+
+    user_id = login_data["user_id"]
+    client_id = login_data["client_id"] or f"{user_id}_U"
+    secret_code = login_data["secret_code"]
+    saved_auth_code = login_data["auth_code"]
+    saved_token = login_data["token"]
+    saved_usertoken = login_data["usertoken"] or user_id
+
+    print("🔐 LOGIN POLICY:")
+    print("   1. Saved TOKEN")
+    print("   2. Saved AUTH CODE")
+    print("   3. Fresh browser OAuth ONLY if saved AUTH CODE returns None")
+
+    if not user_id or not secret_code:
+        login_sheet.range("C2").value = "Missing User ID / Secret Code"
+        print("❌ Missing User ID or Secret Code in Login sheet.")
+        return False
+
+    # ==============================================================
+    # STEP 1 — SAVED TOKEN FIRST
+    # ==============================================================
+    if saved_token and saved_usertoken:
+        print("--------------------------------------------------")
+        print("🔐 STEP 1: Trying SAVED ACCESS TOKEN")
+        print(f"   User ID : {user_id}")
+        print(f"   Token   : {str(saved_token)[:20]}...")
+        print(f"   ACTID   : {user_id}")
+
+        try:
+            api = _make_api()
+            _install_oauth_session(api, saved_usertoken, saved_token, user_id)
+
+            # Small HTTP test.  This is NOT used to create a new token.
+            # It only tells us whether the saved session can currently
+            # talk to the broker.
+            test = api.get_quotes(SPOT_EXCHANGE, str(NIFTY_SPOT_TOKEN))
+
+            if test and test.get("lp") not in (None, "", "0", 0):
+                login_sheet.range("C2").value = f"Saved token reused - {user_id}"
+                print(f"✅ REUSING SAVED TOKEN for user: {user_id}")
+                print(f"   NIFTY spot response: {test.get('lp')}")
+                print("   🔐 No OAuth browser login")
+                print("   🔐 No new auth code")
+                return True
+
+            print("❌ Saved token did not return usable market data.")
+        except Exception as e:
+            print(f"❌ Saved token/session failed: {e}")
+
+    # ==============================================================
+    # STEP 2 — SAVED AUTH CODE
+    # ==============================================================
+    if saved_auth_code:
+        print("--------------------------------------------------")
+        print("🔐 STEP 2: Trying AUTH CODE already stored in Login sheet")
+        print(f"   Auth Code: {str(saved_auth_code)[:25]}...")
+        print("   🚫 No browser login yet")
+        print("   🔄 Calling EXACT getAccessToken(auth_code, secret, client_id, uid)...")
+
+        try:
+            api = _make_api()
+
+            result = api.getAccessToken(
+                saved_auth_code,
+                secret_code,
+                client_id,
+                user_id
+            )
+
+            print("getAccessToken() raw result:", result)
+
+            if _apply_access_token_result(
+                api, result, login_sheet, saved_auth_code
+            ):
+                print("✅ Saved AUTH CODE produced a fresh access token.")
+                return True
+
+            # IMPORTANT:
+            # For this program, None/invalid tuple means the saved AUTH
+            # CODE is no longer usable.  NOW, and only now, do browser OAuth.
+            print("❌ getAccessToken() returned None/invalid result.")
+            print("   ➜ Treating saved AUTH CODE as expired/invalid.")
+        except Exception as e:
+            print(f"❌ Saved AUTH CODE exchange raised an error: {e}")
+            print("   ➜ Treating saved AUTH CODE as unusable.")
+
+    else:
+        print("--------------------------------------------------")
+        print("⚠️ No saved AUTH CODE in Login sheet.")
+
+    # ==============================================================
+    # STEP 3 — FRESH BROWSER OAUTH
+    # ==============================================================
+    print("--------------------------------------------------")
+    print("🔄 STEP 3: FRESH OAuth browser login")
+    print("   This happens ONLY after saved TOKEN + saved AUTH CODE fail.")
+
+    if not login_data["password"] or not login_data["totp_secret"]:
+        login_sheet.range("C2").value = (
+            "Saved token/auth code failed; Password/TOTP required for fresh OAuth"
+        )
+        print("❌ Password or TOTP Secret missing; cannot perform fresh OAuth.")
+        return False
+
+    try:
+        api = _make_api()
+
+        login_sheet.range("C2").value = "Opening browser for fresh OAuth..."
+        print(f"   User ID  : {user_id}")
+        print(f"   Client ID: {client_id}")
+        print("   Opening browser for OAuth login...")
+
+        fresh_auth_code = get_auth_code_via_selenium(
+            client_id,
+            user_id,
+            login_data["password"],
+            login_data["totp_secret"]
+        )
+
+        if not fresh_auth_code:
+            print("❌ Browser OAuth did not return an AUTH CODE.")
+            login_sheet.range("C2").value = "Fresh OAuth auth code not received"
+            return False
+
+        print(f"   OAuth authorization code received: {str(fresh_auth_code)[:25]}...")
+        print("   Getting access token...")
+
+        fresh_result = api.getAccessToken(
+            fresh_auth_code,
+            secret_code,
+            client_id,
+            user_id
+        )
+
+        print("Fresh getAccessToken() raw result:", fresh_result)
+
+        if not _apply_access_token_result(
+            api, fresh_result, login_sheet, fresh_auth_code
+        ):
+            print("❌ Fresh AUTH CODE also failed to produce a token.")
+            login_sheet.range("C2").value = "Fresh OAuth token exchange failed"
+            return False
+
+        print("✅ Fresh OAuth login completed.")
+        return True
+
+    except Exception as e:
+        print(f"❌ Fresh OAuth login error: {e}")
+        import traceback
+        traceback.print_exc()
+        login_sheet.range("C2").value = f"OAuth error: {str(e)[:120]}"
+        return False
 
 
 # ----------------------------------------------------------------------
@@ -1676,47 +1792,91 @@ def apply_atm_highlight(oc_sheet, atm_strike):
 # ----------------------------------------------------------------------
 # Function to get first OTM Call and Put strikes
 # ----------------------------------------------------------------------
-def get_first_otm_strikes(df_full, spot_ltp, atm_strike, strike_step=50):
-    """Get the first OTM Call (strike ABOVE spot) and first OTM Put (strike BELOW spot)
-    from the FULL dataframe before trimming"""
-    
-    # Get all unique strikes from the FULL dataframe
-    strikes = sorted(df_full["strike"].unique())
-    
-    # Find OTM Call (strike ABOVE spot, closest to spot) - LEFT side of Option Chain
-    otm_call_strike = None
-    
-    for strike in strikes:
-        if strike > spot_ltp:
-            otm_call_strike = strike
-            break
-    
-    # If no OTM Call found above spot, use ATM + step
-    if otm_call_strike is None:
+def get_nse_strike_classification(df_full, spot_ltp):
+    """
+    NSE-style strike classification using the ACTUAL strikes present in
+    the NFO instrument list.
+
+    Definitions:
+      CE:
+        ITM = strike < spot
+        ATM = nearest actual strike to spot
+        OTM = strike > spot
+
+      PE:
+        ITM = strike > spot
+        ATM = nearest actual strike to spot
+        OTM = strike < spot
+
+    The function NEVER invents a strike.  It selects from the actual
+    available NIFTY option strikes.
+    """
+    strikes = sorted(
+        pd.to_numeric(df_full["strike"], errors="coerce")
+        .dropna()
+        .unique()
+        .tolist()
+    )
+
+    if not strikes:
+        return {
+            "atm": None,
+            "ce_itm": None,
+            "ce_otm": None,
+            "pe_itm": None,
+            "pe_otm": None,
+        }
+
+    spot = float(spot_ltp)
+
+    # NSE option-chain ATM = nearest available strike.
+    atm = min(strikes, key=lambda x: (abs(x - spot), x))
+
+    below = [s for s in strikes if s < spot]
+    above = [s for s in strikes if s > spot]
+
+    # Call:
+    #   nearest strike below spot = first ITM CE
+    #   nearest strike above spot = first OTM CE
+    ce_itm = max(below) if below else None
+    ce_otm = min(above) if above else None
+
+    # Put:
+    #   nearest strike above spot = first ITM PE
+    #   nearest strike below spot = first OTM PE
+    pe_itm = min(above) if above else None
+    pe_otm = max(below) if below else None
+
+    return {
+        "atm": atm,
+        "ce_itm": ce_itm,
+        "ce_otm": ce_otm,
+        "pe_itm": pe_itm,
+        "pe_otm": pe_otm,
+    }
+
+
+def get_first_otm_strikes(df_full, spot_ltp, atm_strike=None, strike_step=50):
+    """
+    Compatibility wrapper used by the existing option-chain code.
+
+    IMPORTANT:
+    It uses the actual NSE/NFO strikes in df_full.
+    It does NOT calculate OTM as ATM +/- a hard-coded 50 if an actual
+    strike is available.
+    """
+    cls = get_nse_strike_classification(df_full, spot_ltp)
+
+    otm_call_strike = cls["ce_otm"]
+    otm_put_strike = cls["pe_otm"]
+
+    # Only as a final defensive fallback.
+    if otm_call_strike is None and atm_strike is not None:
         otm_call_strike = atm_strike + strike_step
-        # Find the closest strike above ATM
-        for strike in strikes:
-            if strike > atm_strike:
-                otm_call_strike = strike
-                break
-    
-    # Find OTM Put (strike BELOW spot, closest to spot) - RIGHT side of Option Chain
-    otm_put_strike = None
-    
-    for strike in reversed(strikes):
-        if strike < spot_ltp:
-            otm_put_strike = strike
-            break
-    
-    # If no OTM Put found below spot, use ATM - step
-    if otm_put_strike is None:
+
+    if otm_put_strike is None and atm_strike is not None:
         otm_put_strike = atm_strike - strike_step
-        # Find the closest strike below ATM
-        for strike in reversed(strikes):
-            if strike < atm_strike:
-                otm_put_strike = strike
-                break
-    
+
     return otm_call_strike, otm_put_strike
 
 
@@ -1967,7 +2127,7 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
 
     pre_expiry = None
     pre_no_of_strike = None
-    refresh_rate = 1
+    refresh_rate = 0.5  #  1
     last_aggregation_time = None
     
     # Check Tick_History status at startup
@@ -2072,10 +2232,30 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
 
             df_full = pd.DataFrame(rows).sort_values(by="strike").reset_index(drop=True)
 
-            # Find the index of the strike closest to spot
-            df_full["strike_diff"] = abs(df_full["strike"] - spot_ltp)
-            atm_idx = df_full["strike_diff"].idxmin()
-            atm_strike = df_full.loc[atm_idx, "strike"]
+            # ============================================================
+            # NSE-STYLE ACTUAL STRIKE CLASSIFICATION
+            # ============================================================
+            strike_class = get_nse_strike_classification(df_full, spot_ltp)
+
+            atm_strike = strike_class["atm"]
+            ce_itm_strike = strike_class["ce_itm"]
+            ce_otm_strike = strike_class["ce_otm"]
+            pe_itm_strike = strike_class["pe_itm"]
+            pe_otm_strike = strike_class["pe_otm"]
+
+            if atm_strike is None:
+                print("⚠️ No actual NSE strike available for current spot.")
+                time.sleep(refresh_rate)
+                continue
+
+            # Locate the actual ATM row.
+            atm_matches = df_full[df_full["strike"] == atm_strike]
+            if atm_matches.empty:
+                print("⚠️ ATM strike row not found.")
+                time.sleep(refresh_rate)
+                continue
+
+            atm_idx = atm_matches.index[0]
 
             # Get ATM data
             atm_ce_price = df_full.loc[atm_idx, "CE_lp"]
@@ -2092,8 +2272,28 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                 print("⚠️ IV calculator update failed; IV will be 0 for this refresh.")
             pre_expiry = expiry_input
 
-            # Get first OTM Call and Put strikes from FULL dataframe
-            otm_call_strike, otm_put_strike = get_first_otm_strikes(df_full, spot_ltp, atm_strike, STRIKE_STEP)
+            # First OTM strikes from ACTUAL NSE/NFO strike list.
+            otm_call_strike = ce_otm_strike
+            otm_put_strike = pe_otm_strike
+
+            # Defensive fallback only if the instrument list has no
+            # strike on one side.
+            if otm_call_strike is None:
+                otm_call_strike = get_first_otm_strikes(
+                    df_full, spot_ltp, atm_strike, STRIKE_STEP
+                )[0]
+
+            if otm_put_strike is None:
+                otm_put_strike = get_first_otm_strikes(
+                    df_full, spot_ltp, atm_strike, STRIKE_STEP
+                )[1]
+
+            print(
+                f"🎯 NSE strikes | Spot={spot_ltp:.2f} | "
+                f"ATM={atm_strike} | "
+                f"CE ITM={ce_itm_strike} | CE OTM={ce_otm_strike} | "
+                f"PE ITM={pe_itm_strike} | PE OTM={pe_otm_strike}"
+            )
 
             # Trim to N strikes each side of ATM for display
             lo = max(0, atm_idx - no_of_strike)
@@ -2175,23 +2375,29 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
             
             # Store tick data using FULL dataframe with IV calculation
             store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strike, otm_put_strike, expiry_input, future_ltp, atm_ce_price, atm_pe_price)
-            
             # ============================================================
-            # AGGREGATE CANDLES - APPEND new candles
+            # REAL-TIME CANDLE UPDATE - NO STARTUP-TIMER DELAY
             # ============================================================
-            current_time = dt.now()
-            interval_seconds = AGGREGATION_INTERVAL * 60
-            
-            # Check if we have at least 2 ticks before aggregating
+            # IMPORTANT:
+            # The old code waited AGGREGATION_INTERVAL*60 seconds from
+            # script startup. If the script started at 10:00:30, the first
+            # aggregation happened at 10:01:30, creating a ~30 second delay.
+            #
+            # Now aggregation is checked EVERY refresh cycle.
+            # aggregate_candles() itself writes only the current candle row
+            # when its values changed, so old candle rows are NOT rewritten.
+            # ============================================================
             if tick_counter >= 2:
-                if last_aggregation_time is None or (current_time - last_aggregation_time).total_seconds() >= interval_seconds:
-                    print(f"📊 Aggregating {AGGREGATION_INTERVAL}-minute candles...")
-                    aggregate_candles(history_sheet, candle_sheet, AGGREGATION_INTERVAL)
-                    last_aggregation_time = current_time
+                aggregate_candles(
+                    history_sheet,
+                    candle_sheet,
+                    AGGREGATION_INTERVAL
+                )
             
             oc_sheet.range("C1").value = (
                 f"{SYMBOL} Spot={spot_ltp:.1f}  ATM={atm_strike}  "
-                f"OTM Call={otm_call_strike} (ABOVE)  OTM Put={otm_put_strike} (BELOW)  "
+                f"CE ITM={ce_itm_strike}  CE OTM={otm_call_strike}  "
+                f"PE ITM={pe_itm_strike}  PE OTM={otm_put_strike}  "
                 f"Ticks={tick_counter}  Aggregation={AGGREGATION_INTERVAL}min  "
                 f"Feed={feed_time}  Req={request_time}  LTT={last_traded_time}  "
                 f"IV=LIVE DTE={current_iv_dte_days} T={current_iv_T:.8f} r=10%"
@@ -2223,6 +2429,17 @@ if __name__ == "__main__":
 
     load_instruments()
 
+    # --------------------------------------------------------------
+    # Start WebSocket with the CURRENT OAuth session.
+    # Authentication recovery has already happened inside
+    # shoonya_login().
+    # --------------------------------------------------------------
+    feed_opened = False
+    print("🔌 Starting WebSocket with current OAuth session...")
+    print(f"   WebSocket UID : {getattr(api, 'uid', '')}")
+    print(f"   WebSocket ACTID: {getattr(api, 'actid', '')}")
+    print(f"   Token loaded  : {str(getattr(api, 'token', ''))[:20]}...")
+
     api.start_websocket(
         order_update_callback=event_handler_order_update,
         subscribe_callback=event_handler_quote_update,
@@ -2230,9 +2447,23 @@ if __name__ == "__main__":
         socket_close_callback=event_handler_socket_closed,
     )
 
-    while not feed_opened:
-        time.sleep(0.2)
-    print("✅ WebSocket connected. Enter expiry/strike count in the OptionChain sheet.")
+    # IMPORTANT:
+    # A WebSocket timeout is NOT automatically treated as a market-data
+    # timeout.  Noren may reconnect asynchronously.  Wait patiently.
+    websocket_wait = 0
+    while not feed_opened and websocket_wait < 60:
+        time.sleep(0.5)
+        websocket_wait += 0.5
+
+    if feed_opened:
+        print("✅ WebSocket connected. Enter expiry/strike count in the OptionChain sheet.")
+    else:
+        print("⚠️ WebSocket has not opened after 60 seconds.")
+        print("   Continuing; Noren's websocket may reconnect asynchronously.")
+        print("   No new OAuth code will be generated merely because no tick arrived.")
+
     print("-" * 50)
 
+    # NEVER stop here merely because the first websocket/tick was delayed.
+    # The option-chain loop itself continues and handles market-data gaps.
     run_option_chain(wb, oc_sheet, history_sheet, candle_sheet)
