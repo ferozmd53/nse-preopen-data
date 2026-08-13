@@ -8,12 +8,6 @@ import warnings
 from datetime import timezone, timedelta
 
 warnings.filterwarnings("ignore")
-try:
-    import requests
-    response = requests.get('https://api.ipify.org', timeout=5)
-    print(f"\nYour current IP address is: {response.text}")
-except:
-    pass
 # ---- dependency bootstrap ----
 for pkg in ["pandas", "pyotp", "xlwings", "requests", "numpy",
             "selenium", "webdriver_manager", "openpyxl"]:
@@ -398,6 +392,108 @@ def calculate_iv_for_strike(strike_price, call_price, put_price):
 # Workbook setup
 
 # ----------------------------------------------------------------------
+# PUBLIC IP CHECK - Login sheet B11/B12
+# B11 = PREVIOUS IP (keep the IP configured/approved in Shoonya)
+# B12 = NEW IP (automatically fetched at every script start)
+# The script stops if the two IP addresses do not match.
+# ----------------------------------------------------------------------
+def get_current_public_ip():
+    """Get the machine's current public IPv4 address."""
+    providers = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://checkip.amazonaws.com",
+    ]
+    last_error = None
+    for url in providers:
+        try:
+            r = requests.get(url, timeout=5)
+            ip = r.text.strip()
+            if ip and len(ip) <= 64 and "." in ip:
+                return ip
+        except Exception as e:
+            last_error = e
+    print(f"❌ Could not determine current public IP: {last_error}")
+    return ""
+
+
+def check_login_ip(login_sheet):
+    """Write current IP to Login!B12 and compare it with Login!B11.
+
+    B11 is intentionally NOT overwritten. It is the previous/approved IP.
+    B12 is always refreshed with the current public IP.
+    """
+    try:
+        # Always make the labels explicit so the rows are easy to identify.
+        login_sheet.range("A11").value = "PREVIOUS IP ADDRESS"
+        login_sheet.range("A12").value = "NEW IP ADDRESS"
+
+        previous_ip = str(login_sheet.range("B11").value or "").strip()
+        current_ip = get_current_public_ip()
+
+        if not current_ip:
+            login_sheet.range("C11").value = "IP CHECK FAILED"
+            login_sheet.book.save()
+            print("❌ Current public IP could not be obtained.")
+            print("❌ Script stopped before login/WebSocket.")
+            return False
+
+        # Always show the newly detected IP in Excel.
+        login_sheet.range("B12").value = current_ip
+        login_sheet.range("C12").value = dt.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        print("--------------------------------------------------")
+        print("🌐 SHOONYA IP ADDRESS CHECK")
+        print(f"   Previous/Approved IP (Login!B11): {previous_ip or '[BLANK]'}")
+        print(f"   Current/New IP       (Login!B12): {current_ip}")
+        print("   📌 Set/allow this IP address in Shoonya Trading Platform.")
+
+        # First-time setup: if B11 is blank, store current IP as the approved
+        # previous IP so the next run can perform the strict comparison.
+        if not previous_ip:
+            login_sheet.range("B11").value = current_ip
+            login_sheet.range("C11").value = "FIRST IP SAVED - APPROVED"
+            login_sheet.range("C12").value = "CURRENT IP MATCHES FIRST SAVED IP"
+            login_sheet.book.save()
+            print("⚠️ Login!B11 was blank.")
+            print(f"✅ First IP saved as approved IP: {current_ip}")
+            print("   Next run will strictly compare B11 with B12.")
+            return True
+
+        if previous_ip != current_ip:
+            login_sheet.range("C11").value = "IP MISMATCH - SCRIPT STOPPED"
+            login_sheet.range("C12").value = "SET CURRENT IP IN SHOONYA TRADING PLATFORM"
+            login_sheet.book.save()
+
+            print("❌❌❌ IP ADDRESS MISMATCH ❌❌❌")
+            print(f"   Previous/Approved IP : {previous_ip}")
+            print(f"   Current/New IP       : {current_ip}")
+            print("")
+            print("🚫 SCRIPT STOPPED.")
+            print("👉 Set/whitelist the CURRENT IP in the Shoonya Trading Platform.")
+            print(f"👉 Current IP to set in Shoonya: {current_ip}")
+            print("👉 After changing the Shoonya IP, run the script again.")
+            print("--------------------------------------------------")
+            return False
+
+        login_sheet.range("C11").value = "IP MATCHED - OK"
+        login_sheet.range("C12").value = "CURRENT IP MATCHES APPROVED IP"
+        login_sheet.book.save()
+        print("✅ IP MATCHED.")
+        print("   Shoonya Trading Platform IP is correct for this machine.")
+        print("--------------------------------------------------")
+        return True
+    except Exception as e:
+        print(f"❌ IP check error: {e}")
+        try:
+            login_sheet.range("C11").value = f"IP CHECK ERROR: {str(e)[:100]}"
+            login_sheet.book.save()
+        except Exception:
+            pass
+        return False
+
+
+# ----------------------------------------------------------------------
 def get_or_create_workbook():
     global AGGREGATION_INTERVAL, tick_counter
     
@@ -427,7 +523,7 @@ def get_or_create_workbook():
         oc_sheet.range("A3").value = "RefreshRate(sec) =>"
         oc_sheet.range("A4").value = "Aggregation Interval (min) =>"
         oc_sheet.range("B2").value = NUMBER_OF_STRIKES
-        oc_sheet.range("B3").value = 1
+        oc_sheet.range("B3").value = 3
         oc_sheet.range("B4").value = AGGREGATION_INTERVAL
         oc_sheet.range("C1").value = "Available expiries -->"
         oc_sheet.range("G1").value = f"Symbol: {SYMBOL}"
@@ -2127,7 +2223,7 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
 
     pre_expiry = None
     pre_no_of_strike = None
-    refresh_rate = 0.5  #  1
+    refresh_rate = 1
     last_aggregation_time = None
     
     # Check Tick_History status at startup
@@ -2422,6 +2518,13 @@ if __name__ == "__main__":
     print("-" * 50)
     
     wb, login_sheet, oc_sheet, history_sheet, candle_sheet = get_or_create_workbook()
+
+    # ==========================================================
+    # IP SECURITY CHECK - MUST PASS BEFORE SHOONYA LOGIN
+    # ==========================================================
+    if not check_login_ip(login_sheet):
+        print("❌ IP verification failed. Program terminated.")
+        sys.exit(1)
 
     if not shoonya_login(login_sheet):
         print("❌ Login failed. Check the Login sheet.")
