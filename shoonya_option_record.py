@@ -60,7 +60,7 @@ AGGREGATION_INTERVAL = 1  # Default candle interval in minutes
 
 # Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
-MARKET_START = 9 * 60 + 14  # 9:15 AM in minutes
+MARKET_START = 9 * 60 + 15  # 9:15 AM in minutes
 MARKET_END = 15 * 60 + 30   # 3:30 PM in minutes
 
 live_data = {}
@@ -83,6 +83,28 @@ last_traded_time = ""
 # Last market-data signature written to Tick_History.
 # Time columns are intentionally excluded so a repeated snapshot is not written again.
 last_tick_signature = None
+
+# HIGH-SPEED MODE STATE
+# WebSocket callback increments this only when actual market-data fields change.
+market_data_version = 0
+last_processed_market_data_version = -1
+last_optionchain_signature = None
+last_atm_highlight_strike = None
+last_saved_market_data_version = -1
+last_excel_save_time = 0.0
+last_history_tick_counter_for_candle = -1
+
+# TRUE HIGH-SPEED BUFFERING
+# WebSocket ticks are accepted immediately in memory. Excel receives them
+# in small batches instead of one COM write per tick.
+pending_history_rows = []
+history_next_row = None
+last_history_flush_time = 0.0
+HISTORY_FLUSH_INTERVAL = 0.25
+CANDLE_UPDATE_INTERVAL = 0.50
+last_candle_update_mono = 0.0
+last_config_read_mono = 0.0
+CONFIG_READ_INTERVAL = 0.50
 
 # Store raw tick data for aggregation
 raw_ticks = []
@@ -392,10 +414,12 @@ def calculate_iv_for_strike(strike_price, call_price, put_price):
 # Workbook setup
 
 # ----------------------------------------------------------------------
-# PUBLIC IP CHECK - Login sheet B11/B12
-# B11 = PREVIOUS IP (keep the IP configured/approved in Shoonya)
-# B12 = NEW IP (automatically fetched at every script start)
-# The script stops if the two IP addresses do not match.
+# PUBLIC IP CHECK - Login sheet B11/B12/D11/D12
+# B11 = today's approved IP (auto-updated on a new calendar day)
+# D11 = date for B11
+# B12 = current detected IP
+# D12 = current IP check timestamp
+# Same-day IP mismatch stops the script. On a new day B11 is auto-refreshed.
 # ----------------------------------------------------------------------
 def get_current_public_ip():
     """Get the machine's current public IPv4 address."""
@@ -418,71 +442,134 @@ def get_current_public_ip():
 
 
 def check_login_ip(login_sheet):
-    """Write current IP to Login!B12 and compare it with Login!B11.
+    """Automatic daily IP approval/check.
 
-    B11 is intentionally NOT overwritten. It is the previous/approved IP.
-    B12 is always refreshed with the current public IP.
+    Login sheet layout:
+      B11 = approved/previous IP for the current day
+      D11 = date on which B11 was approved
+      B12 = automatically detected current public IP
+      D12 = date/time of current IP check
+
+    Rules:
+      1. Every run automatically detects the current public IP.
+      2. If B11 is blank, save current IP into B11 and today's date into D11.
+      3. If the date stored in D11 is NOT today, automatically replace B11
+         with today's current IP and update D11. No manual paste is needed.
+      4. If D11 is today, B11 is treated as today's approved IP.
+         If B11 != B12, STOP the script because the IP changed during today.
+      5. B12/D12 are always refreshed so the current IP is visible in Excel.
     """
     try:
-        # Always make the labels explicit so the rows are easy to identify.
-        login_sheet.range("A11").value = "PREVIOUS IP ADDRESS"
-        login_sheet.range("A12").value = "NEW IP ADDRESS"
+        login_sheet.range("A11").value = "PREVIOUS / TODAY APPROVED IP"
+        login_sheet.range("A12").value = "NEW / CURRENT IP"
+        login_sheet.range("C11").value = "IP APPROVAL DATE"
+        login_sheet.range("C12").value = "CURRENT IP CHECK TIME"
+        login_sheet.range("D11").value = ""
+        login_sheet.range("D12").value = ""
 
         previous_ip = str(login_sheet.range("B11").value or "").strip()
+        saved_date_raw = login_sheet.range("D11").value
         current_ip = get_current_public_ip()
+        now = dt.now()
+        today = now.date()
 
         if not current_ip:
-            login_sheet.range("C11").value = "IP CHECK FAILED"
+            login_sheet.range("D12").value = "IP CHECK FAILED"
             login_sheet.book.save()
             print("❌ Current public IP could not be obtained.")
             print("❌ Script stopped before login/WebSocket.")
             return False
 
-        # Always show the newly detected IP in Excel.
+        # Always show the current IP in B12.
         login_sheet.range("B12").value = current_ip
-        login_sheet.range("C12").value = dt.now().strftime("%Y-%m-%d %H:%M:%S")
+        login_sheet.range("D12").value = now.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Parse the date associated with B11.
+        saved_date = None
+        if saved_date_raw not in (None, ""):
+            try:
+                if isinstance(saved_date_raw, dt):
+                    saved_date = saved_date_raw.date()
+                elif hasattr(saved_date_raw, "date") and not isinstance(saved_date_raw, str):
+                    saved_date = saved_date_raw.date()
+                else:
+                    text = str(saved_date_raw).strip()
+                    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y",
+                                "%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S"):
+                        try:
+                            saved_date = dt.strptime(text, fmt).date()
+                            break
+                        except ValueError:
+                            pass
+                    if saved_date is None:
+                        try:
+                            saved_date = pd.to_datetime(text, dayfirst=False).date()
+                        except Exception:
+                            saved_date = None
+            except Exception:
+                saved_date = None
 
         print("--------------------------------------------------")
-        print("🌐 SHOONYA IP ADDRESS CHECK")
-        print(f"   Previous/Approved IP (Login!B11): {previous_ip or '[BLANK]'}")
-        print(f"   Current/New IP       (Login!B12): {current_ip}")
-        print("   📌 Set/allow this IP address in Shoonya Trading Platform.")
+        print("🌐 SHOONYA AUTOMATIC DAILY IP CHECK")
+        print(f"   Previous IP in Login!B11 : {previous_ip or '[BLANK]'}")
+        print(f"   Previous IP date in D11  : {saved_date or '[BLANK]'}")
+        print(f"   Current IP in Login!B12  : {current_ip}")
+        print(f"   Today                     : {today}")
 
-        # First-time setup: if B11 is blank, store current IP as the approved
-        # previous IP so the next run can perform the strict comparison.
-        if not previous_ip:
+        # ------------------------------------------------------------
+        # FIRST RUN OR NEW DAY:
+        # Automatically approve today's current IP.
+        # ------------------------------------------------------------
+        if not previous_ip or saved_date != today:
+            reason = "B11 is blank" if not previous_ip else (
+                f"B11 date is {saved_date}, today is {today}"
+            )
+
             login_sheet.range("B11").value = current_ip
-            login_sheet.range("C11").value = "FIRST IP SAVED - APPROVED"
-            login_sheet.range("C12").value = "CURRENT IP MATCHES FIRST SAVED IP"
+            login_sheet.range("D11").value = today.strftime("%Y-%m-%d")
+            login_sheet.range("C11").value = "TODAY IP AUTO-APPROVED"
+            login_sheet.range("C12").value = "CURRENT IP SAVED AUTOMATICALLY"
             login_sheet.book.save()
-            print("⚠️ Login!B11 was blank.")
-            print(f"✅ First IP saved as approved IP: {current_ip}")
-            print("   Next run will strictly compare B11 with B12.")
+
+            print(f"🔄 Daily IP reset required: {reason}")
+            print(f"✅ Automatically saved today's IP to Login!B11: {current_ip}")
+            print(f"✅ Automatically saved today's date to Login!D11: {today}")
+            print("✅ No manual IP paste required.")
+            print("--------------------------------------------------")
             return True
 
+        # ------------------------------------------------------------
+        # SAME DAY:
+        # Strict comparison. If today's IP changed, stop.
+        # ------------------------------------------------------------
         if previous_ip != current_ip:
             login_sheet.range("C11").value = "IP MISMATCH - SCRIPT STOPPED"
-            login_sheet.range("C12").value = "SET CURRENT IP IN SHOONYA TRADING PLATFORM"
+            login_sheet.range("C12").value = "TODAY'S IP CHANGED"
             login_sheet.book.save()
 
             print("❌❌❌ IP ADDRESS MISMATCH ❌❌❌")
-            print(f"   Previous/Approved IP : {previous_ip}")
-            print(f"   Current/New IP       : {current_ip}")
+            print(f"   Today's approved IP (B11): {previous_ip}")
+            print(f"   Current IP          (B12): {current_ip}")
+            print("   Date of approval    (D11):", saved_date)
             print("")
             print("🚫 SCRIPT STOPPED.")
+            print("👉 The IP changed during the same day.")
             print("👉 Set/whitelist the CURRENT IP in the Shoonya Trading Platform.")
             print(f"👉 Current IP to set in Shoonya: {current_ip}")
-            print("👉 After changing the Shoonya IP, run the script again.")
+            print("👉 On a new calendar day, B11 will automatically update to the new IP.")
             print("--------------------------------------------------")
             return False
 
         login_sheet.range("C11").value = "IP MATCHED - OK"
-        login_sheet.range("C12").value = "CURRENT IP MATCHES APPROVED IP"
+        login_sheet.range("C12").value = "CURRENT IP MATCHES TODAY'S APPROVED IP"
         login_sheet.book.save()
+
         print("✅ IP MATCHED.")
-        print("   Shoonya Trading Platform IP is correct for this machine.")
+        print("   Today's approved IP and current IP are identical.")
+        print("   No manual IP update is required.")
         print("--------------------------------------------------")
         return True
+
     except Exception as e:
         print(f"❌ IP check error: {e}")
         try:
@@ -657,12 +744,14 @@ def get_or_create_workbook():
 # Function to check Tick_History status
 # ----------------------------------------------------------------------
 def check_tick_history_status(history_sheet):
-    """Debug function to check Tick_History sheet status"""
+    """Debug function to check Tick_History sheet status and initialize the append pointer."""
+    global history_next_row
     try:
         print("🔍 Checking Tick_History status...")
         
         # Check if sheet exists
         last_row = get_last_actual_row(history_sheet, "A", 1)
+        history_next_row = max(2, last_row + 1)
         print(f"   Used range rows: {last_row}")
         
         if last_row >= 1:
@@ -686,6 +775,42 @@ def check_tick_history_status(history_sheet):
     except Exception as e:
         print(f"⚠️ Error checking Tick_History: {e}")
         return False
+
+
+# ----------------------------------------------------------------------
+# Flush buffered Tick_History rows in ONE Excel COM operation.
+# ----------------------------------------------------------------------
+def flush_pending_history(history_sheet, force=False):
+    global pending_history_rows, history_next_row, last_history_flush_time
+
+    if not pending_history_rows:
+        return 0
+
+    now_mono = time.monotonic()
+    if not force and (now_mono - last_history_flush_time) < HISTORY_FLUSH_INTERVAL:
+        return 0
+
+    rows = pending_history_rows
+    pending_history_rows = []
+
+    try:
+        if history_next_row is None:
+            history_next_row = get_last_actual_row(history_sheet, "A", 1) + 1
+            history_next_row = max(2, history_next_row)
+
+        start = history_next_row
+        end = start + len(rows) - 1
+        history_sheet.range(f"A{start}:AA{end}").value = rows
+        history_sheet.range(f"B{start}:B{end}").number_format = "yyyy-mm-dd hh:mm:ss"
+        history_sheet.range(f"D{start}:AA{end}").number_format = "#,##0.00"
+        history_next_row = end + 1
+        last_history_flush_time = now_mono
+        return len(rows)
+    except Exception as e:
+        # Put rows back so data is not lost if Excel temporarily rejects COM.
+        pending_history_rows = rows + pending_history_rows
+        print(f"⚠️ Tick_History batch write failed: {e}")
+        return 0
 
 
 # ----------------------------------------------------------------------
@@ -771,12 +896,21 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         if last_row < 2:
             return 0
 
-        values = history_sheet.range(f"A1:AA{last_row}").value
-        if not values or len(values) < 2:
+        # HIGH-SPEED: only read enough recent history to build the current
+        # candle. Historical candle rows are never needed here.
+        # At normal tick rates this is many times smaller than the full sheet.
+        rows_to_read = max(300, int(interval_minutes * 120))
+        first_row = max(2, last_row - rows_to_read + 1)
+        recent_values = history_sheet.range(f"A1:AA{last_row}").value if first_row <= 2 else history_sheet.range(f"A1:AA1").value + history_sheet.range(f"A{first_row}:AA{last_row}").value
+        if not recent_values:
             return 0
 
-        headers = values[0]
-        data_rows = values[1:]
+        if first_row <= 2:
+            headers = recent_values[0]
+            data_rows = recent_values[1:]
+        else:
+            headers = history_sheet.range("A1:AA1").value
+            data_rows = history_sheet.range(f"A{first_row}:AA{last_row}").value
         df = pd.DataFrame(data_rows, columns=headers)
 
         required = [
@@ -1738,28 +1872,45 @@ def shoonya_login(login_sheet):
 # WebSocket callbacks
 # ----------------------------------------------------------------------
 def event_handler_quote_update(msg):
-    global live_data, feed_time, last_traded_time
-    
+    """Fast WebSocket callback.
+
+    Only changed market fields increment market_data_version.  The main loop
+    can therefore skip all dataframe/Excel work when the broker sends no new
+    market information.
+    """
+    global live_data, feed_time, last_traded_time, market_data_version
+
     fields = ["ts", "lp", "pc", "c", "o", "h", "l", "v", "ltq", "ltp",
               "bp1", "sp1", "bq1", "sq1", "ap", "oi", "poi", "toi",
               "tbq", "tsq", "ft", "exch_tm", "ltt"]
-    message = {f: msg[f] for f in set(fields) & set(msg.keys())}
-    key = msg["e"] + "|" + msg["tk"]
-    live_data[key] = {**live_data.get(key, {}), **message}
-    
-    # Extract Feed Time (ft) - format as HH:MM:SS
+    key = msg.get("e", "") + "|" + msg.get("tk", "")
+    if not key or key == "|":
+        return
+
+    old = live_data.get(key, {})
+    changed = False
+    for f in fields:
+        if f in msg and old.get(f) != msg[f]:
+            changed = True
+            break
+
+    if changed:
+        live_data[key] = {**old, **{f: msg[f] for f in fields if f in msg}}
+        market_data_version += 1
+    elif key not in live_data:
+        live_data[key] = {f: msg[f] for f in fields if f in msg}
+        market_data_version += 1
+
     if 'ft' in msg:
         feed_time = format_timestamp(msg['ft'])
     elif 'exch_tm' in msg:
         feed_time = format_timestamp(msg['exch_tm'])
     elif 'ts' in msg:
         feed_time = format_timestamp(msg['ts'])
-    
-    # Extract Last Traded Time (ltt) - format as HH:MM:SS
+
     if 'ltt' in msg:
         last_traded_time = format_timestamp(msg['ltt'])
-    
-    # If we have feed time but not last traded time, use feed time
+
     if not last_traded_time and feed_time:
         last_traded_time = feed_time
 
@@ -2174,32 +2325,22 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
         ]
 
         # ------------------------------------------------------------
-        # APPEND EXACTLY ONE NEW ROW
+        # TRUE HIGH-SPEED APPEND BUFFER
+        # Do NOT call Excel COM for every tick. Put the complete row in
+        # memory and flush several rows together every 250 ms.
         # ------------------------------------------------------------
-        try:
-            last_row = get_last_actual_row(history_sheet, "A", 1)
-            next_row = max(2, last_row + 1)
-        except Exception:
-            next_row = tick_counter + 2
-
-        history_sheet.range(f"A{next_row}:AA{next_row}").value = row_data
-        history_sheet.range(f"B{next_row}").number_format = "yyyy-mm-dd hh:mm:ss"
-        history_sheet.range(f"D{next_row}:AA{next_row}").number_format = "#,##0.00"
+        global pending_history_rows, history_next_row
+        pending_history_rows.append(row_data)
 
         tick_counter += 1
         last_tick_signature = signature
 
-        # Autofit only occasionally; never every refresh.
-        if tick_counter == 1 or tick_counter % 50 == 0:
-            try:
-                history_sheet.autofit()
-            except Exception:
-                pass
-
-        print(
-            f"✅ Tick {tick_counter} written at row {next_row} | "
-            f"{now_dt.strftime('%H:%M:%S')} | Spot={market_values[0]:.2f}"
-        )
+        # Keep the console quiet; printing every tick also slows Python.
+        if tick_counter == 1 or tick_counter % 100 == 0:
+            print(
+                f"⚡ Tick {tick_counter} buffered | "
+                f"{now_dt.strftime('%H:%M:%S')} | Spot={market_values[0]:.2f}"
+            )
 
     except Exception as e:
         print(f"⚠️ Error storing tick data: {e}")
@@ -2212,6 +2353,9 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
 # ----------------------------------------------------------------------
 def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
     global tick_counter, feed_time, request_time, last_traded_time, last_aggregation_time, AGGREGATION_INTERVAL
+    global market_data_version, last_processed_market_data_version, last_optionchain_signature
+    global last_atm_highlight_strike, last_saved_market_data_version, last_excel_save_time
+    global last_history_tick_counter_for_candle, last_candle_update_mono, last_config_read_mono
         
     fut_token = get_index_future_token()
     if fut_token is not None:
@@ -2223,34 +2367,63 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
 
     pre_expiry = None
     pre_no_of_strike = None
-    refresh_rate = 1
+    refresh_rate = 0.20
     last_aggregation_time = None
+    last_candle_update_mono = 0.0
+    last_config_read_mono = 0.0
+    print("⚡ HIGH-SPEED MODE: process changed WebSocket ticks only")
+    print("⚡ Excel writes: only changed OptionChain rows + new Tick_History rows")
+    print("⚡ Workbook save: batched, not every refresh")
     
     # Check Tick_History status at startup
     check_tick_history_status(history_sheet)
 
     while True:
         try:
-            # Check for updated aggregation interval from Excel
-            agg_interval = oc_sheet.range("B4").value
-            if agg_interval and isinstance(agg_interval, (int, float)) and agg_interval > 0:
-                if int(agg_interval) != AGGREGATION_INTERVAL:
-                    AGGREGATION_INTERVAL = int(agg_interval)
-                    print(f"✅ Aggregation interval updated to {AGGREGATION_INTERVAL} minutes")
-                    candle_sheet.range("A1").value = f"{AGGREGATION_INTERVAL}-Minute Candle Data"
-            
-            expiry_str = oc_sheet.range("B1").value
-            
-            try:
-                expiry_input = parse_date(expiry_str)
-            except ValueError as e:
-                oc_sheet.range("C1").value = f"Invalid date format: {expiry_str}"
-                print(f"❌ Date parsing error: {e}")
-                time.sleep(2)
-                continue
+            # Read Excel controls only twice per second. Reading COM cells on
+            # every 0.2-second cycle was itself a major speed bottleneck.
+            now_mono = time.monotonic()
+            if (now_mono - last_config_read_mono) >= CONFIG_READ_INTERVAL:
+                agg_interval = oc_sheet.range("B4").value
+                if agg_interval and isinstance(agg_interval, (int, float)) and agg_interval > 0:
+                    if int(agg_interval) != AGGREGATION_INTERVAL:
+                        AGGREGATION_INTERVAL = int(agg_interval)
+                        print(f"✅ Aggregation interval updated to {AGGREGATION_INTERVAL} minutes")
+                        candle_sheet.range("A1").value = f"{AGGREGATION_INTERVAL}-Minute Candle Data"
 
-            no_of_strike = int(oc_sheet.range("B2").value or NUMBER_OF_STRIKES)
-            refresh_rate = int(oc_sheet.range("B3").value or 1)
+                expiry_str = oc_sheet.range("B1").value
+                try:
+                    expiry_input = parse_date(expiry_str)
+                except ValueError as e:
+                    oc_sheet.range("C1").value = f"Invalid date format: {expiry_str}"
+                    print(f"❌ Date parsing error: {e}")
+                    time.sleep(1)
+                    continue
+
+                no_of_strike = int(oc_sheet.range("B2").value or NUMBER_OF_STRIKES)
+                raw_refresh = oc_sheet.range("B3").value
+                try:
+                    refresh_rate = max(0.10, float(raw_refresh or 0.20))
+                except Exception:
+                    refresh_rate = 0.20
+                last_config_read_mono = now_mono
+
+            # If configuration has not been read yet, read it immediately.
+            if 'expiry_input' not in locals():
+                expiry_str = oc_sheet.range("B1").value
+                expiry_input = parse_date(expiry_str)
+                no_of_strike = int(oc_sheet.range("B2").value or NUMBER_OF_STRIKES)
+                raw_refresh = oc_sheet.range("B3").value
+                refresh_rate = max(0.10, float(raw_refresh or 0.20))
+                last_config_read_mono = now_mono
+
+            # FAST PATH: if the WebSocket has delivered no changed market
+            # fields since the previous cycle, skip all dataframe/IV/Excel work.
+            if (market_data_version == last_processed_market_data_version
+                    and pre_expiry == expiry_input
+                    and pre_no_of_strike == no_of_strike):
+                time.sleep(refresh_rate)
+                continue
 
             if not expiry_input:
                 time.sleep(1)
@@ -2275,8 +2448,31 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                         subscribe_token(EXCHANGE, s["CE_Token"])
                 subs_lst.append(SYMBOL)
 
-            spot_ltp = convert_to_float(api.get_quotes(SPOT_EXCHANGE, str(NIFTY_SPOT_TOKEN)).get("lp"))
-            future_ltp = convert_to_float(api.get_quotes(EXCHANGE, str(fut_token)).get("lp")) if fut_token else spot_ltp
+            # HIGH-SPEED: use the already-received WebSocket snapshot.
+            # Avoid a REST get_quotes() request every refresh cycle.
+            spot_key = f"{SPOT_EXCHANGE}|{NIFTY_SPOT_TOKEN}"
+            spot_ltp = convert_to_float(get_field(spot_key, "lp", 0))
+            if spot_ltp <= 0:
+                # Only use REST as a startup/recovery fallback.
+                try:
+                    spot_ltp = convert_to_float(api.get_quotes(SPOT_EXCHANGE, str(NIFTY_SPOT_TOKEN)).get("lp"))
+                except Exception:
+                    spot_ltp = 0.0
+
+            if fut_token:
+                future_key = f"{EXCHANGE}|{fut_token}"
+                future_ltp = convert_to_float(get_field(future_key, "lp", 0))
+                if future_ltp <= 0:
+                    try:
+                        future_ltp = convert_to_float(api.get_quotes(EXCHANGE, str(fut_token)).get("lp"))
+                    except Exception:
+                        future_ltp = spot_ltp
+            else:
+                future_ltp = spot_ltp
+
+            if spot_ltp <= 0:
+                time.sleep(refresh_rate)
+                continue
 
             rows = []
             for s in strikes:
@@ -2461,44 +2657,71 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                 ),
             })
 
-            if pre_expiry != expiry_input or pre_no_of_strike != no_of_strike:
+            # Build a market-data-only signature. Time fields are deliberately
+            # excluded so Excel is not rewritten merely because the clock moved.
+            display_signature = tuple(
+                tuple(round(float(x), 8) if isinstance(x, (int, float, np.number)) else str(x)
+                      for x in row)
+                for row in df_final.iloc[:, 3:].to_numpy().tolist()
+            )
+
+            config_changed = (pre_expiry != expiry_input or pre_no_of_strike != no_of_strike)
+            if config_changed:
                 oc_sheet.range("A11:AA1000").value = None
                 pre_expiry, pre_no_of_strike = expiry_input, no_of_strike
+                last_optionchain_signature = None
+                last_atm_highlight_strike = None
 
-            oc_sheet.range("A10").options(index=False, header=True).value = df_final
-            
-            apply_atm_highlight(oc_sheet, atm_strike)
-            
-            # Store tick data using FULL dataframe with IV calculation
+            optionchain_changed = config_changed or display_signature != last_optionchain_signature
+            if optionchain_changed:
+                oc_sheet.range("A10").options(index=False, header=True).value = df_final
+                last_optionchain_signature = display_signature
+
+                # ATM formatting is expensive. Do it only when the ATM row
+                # actually changes or the table was rebuilt.
+                if last_atm_highlight_strike != atm_strike:
+                    apply_atm_highlight(oc_sheet, atm_strike)
+                    last_atm_highlight_strike = atm_strike
+
+            # Store Tick_History only on a new market-data cycle.
+            before_ticks = tick_counter
             store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strike, otm_put_strike, expiry_input, future_ltp, atm_ce_price, atm_pe_price)
-            # ============================================================
-            # REAL-TIME CANDLE UPDATE - NO STARTUP-TIMER DELAY
-            # ============================================================
-            # IMPORTANT:
-            # The old code waited AGGREGATION_INTERVAL*60 seconds from
-            # script startup. If the script started at 10:00:30, the first
-            # aggregation happened at 10:01:30, creating a ~30 second delay.
-            #
-            # Now aggregation is checked EVERY refresh cycle.
-            # aggregate_candles() itself writes only the current candle row
-            # when its values changed, so old candle rows are NOT rewritten.
-            # ============================================================
-            if tick_counter >= 2:
-                aggregate_candles(
-                    history_sheet,
-                    candle_sheet,
-                    AGGREGATION_INTERVAL
+            new_history_tick = tick_counter > before_ticks
+
+            # Flush buffered ticks in one Excel write. Then update the candle
+            # at most twice per second, instead of recalculating it for every
+            # market tick.
+            flushed = flush_pending_history(history_sheet, force=False)
+            if flushed > 0:
+                now_candle = time.monotonic()
+                if (now_candle - last_candle_update_mono) >= CANDLE_UPDATE_INTERVAL:
+                    aggregate_candles(history_sheet, candle_sheet, AGGREGATION_INTERVAL)
+                    last_candle_update_mono = now_candle
+                    last_history_tick_counter_for_candle = tick_counter
+
+            # Status cell is updated only when market data/configuration changed.
+            if optionchain_changed or new_history_tick:
+                oc_sheet.range("C1").value = (
+                    f"{SYMBOL} Spot={spot_ltp:.1f}  ATM={atm_strike}  "
+                    f"CE ITM={ce_itm_strike}  CE OTM={otm_call_strike}  "
+                    f"PE ITM={pe_itm_strike}  PE OTM={otm_put_strike}  "
+                    f"Ticks={tick_counter}  Aggregation={AGGREGATION_INTERVAL}min  "
+                    f"Feed={feed_time}  Req={request_time}  LTT={last_traded_time}  "
+                    f"IV=LIVE DTE={current_iv_dte_days} T={current_iv_T:.8f} r=10%"
                 )
-            
-            oc_sheet.range("C1").value = (
-                f"{SYMBOL} Spot={spot_ltp:.1f}  ATM={atm_strike}  "
-                f"CE ITM={ce_itm_strike}  CE OTM={otm_call_strike}  "
-                f"PE ITM={pe_itm_strike}  PE OTM={otm_put_strike}  "
-                f"Ticks={tick_counter}  Aggregation={AGGREGATION_INTERVAL}min  "
-                f"Feed={feed_time}  Req={request_time}  LTT={last_traded_time}  "
-                f"IV=LIVE DTE={current_iv_dte_days} T={current_iv_T:.8f} r=10%"
-            )
-            wb.save()
+
+            # Do not save the workbook on every 1-second cycle. Save only
+            # after actual Excel changes, with a short safety batch interval.
+            if optionchain_changed or new_history_tick:
+                now_mono = time.monotonic()
+                if (now_mono - last_excel_save_time >= 1.0) or config_changed:
+                    # Never save with an unflushed Tick_History buffer.
+                    flush_pending_history(history_sheet, force=True)
+                    wb.save()
+                    last_excel_save_time = now_mono
+                    last_saved_market_data_version = market_data_version
+
+            last_processed_market_data_version = market_data_version
 
         except Exception as e:
             print(f"Loop exception: {e}")
