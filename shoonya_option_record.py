@@ -3,6 +3,9 @@ import os
 import sys
 import time
 import math
+import shutil
+import glob
+import pickle
 from datetime import datetime as dt
 import warnings
 from datetime import timezone, timedelta
@@ -16,7 +19,7 @@ except:
     pass
 # ---- dependency bootstrap ----
 for pkg in ["pandas", "pyotp", "xlwings", "requests", "numpy",
-            "selenium", "webdriver_manager", "openpyxl", "scipy"]:
+            "selenium", "webdriver_manager", "openpyxl", "scipy", "pyarrow"]:
     try:
         __import__(pkg)
     except ImportError:
@@ -38,21 +41,6 @@ if not hasattr(np, 'NINF'):
 from NorenRestApiPy.NorenApi import NorenApi
 
 # ============================================================
-# NSE IV ENGINE
-# ============================================================
-# NSE publicly states that its option-chain IV uses a 10% interest rate and
-# is dynamic. NSE does not publish the complete production formula/time
-# convention on the option-chain page. The engine below reproduces the
-# observed NSE convention from the supplied 11-Aug-2026 snapshot:
-#   * spot underlying (not the futures price)
-#   * 10% continuously compounded risk-free rate
-#   * Black-Scholes European pricing
-#   * calendar-day DTE, using a minimum of 1 day on expiry day
-#   * independent CE and PE IV solves
-# This is intentionally independent of the third-party GetIVGreeks package.
-# ============================================================
-
-# ============================================================
 # CONFIGURATION - Hardcoded symbol
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -66,6 +54,37 @@ NIFTY_SPOT_TOKEN = "26000"  # Hardcoded NIFTY spot token
 AGGREGATION_INTERVAL = 1  # Default candle interval in minutes
 # ============================================================
 
+# ============================================================
+# BACKUP CONFIGURATION - protects data if Excel crashes/corrupts/deleted
+# ============================================================
+BACKUP_DIR = os.path.join(BASE_DIR, "backups")
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+TICK_BACKUP_PARQUET = os.path.join(BACKUP_DIR, "tick_history.parquet")
+CANDLE_BACKUP_PARQUET = os.path.join(BACKUP_DIR, "candle_history.parquet")
+
+TICK_BACKUP_PKL = os.path.join(BACKUP_DIR, "tick_history.pkl")
+CANDLE_BACKUP_PKL = os.path.join(BACKUP_DIR, "candle_history.pkl")
+
+BACKUP_EVERY_N_TICKS = 10
+_last_tick_backup_count = 0
+_last_candle_backup_row = 0
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    USE_PARQUET = True
+except ImportError:
+    try:
+        os.system(f"{sys.executable} -m pip install -U pyarrow")
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        USE_PARQUET = True
+    except Exception:
+        USE_PARQUET = False
+        print("⚠️ pyarrow not available — using pickle backup only")
+# ============================================================
+
 # Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_START = 9 * 60 + 15  # 9:15 AM in minutes
@@ -77,22 +96,16 @@ feed_opened = False
 OptionChain_template = []
 api = None
 tick_counter = 0
-# Tick history is no longer capped at 1000 rows. Every received tick is kept until Excel's row limit.
 max_ticks_to_store = None
 
-# Rebuild candles at most once per refresh cycle when new ticks are added.
 last_candle_build_tick = 0
 
-# Timestamp variables
 feed_time = ""
 request_time = ""
 last_traded_time = ""
 
-# Last market-data signature written to Tick_History.
-# Time columns are intentionally excluded so a repeated snapshot is not written again.
 last_tick_signature = None
 
-# Store raw tick data for aggregation
 raw_ticks = []
 last_aggregation_time = None
 last_candle_tick_counter = 0
@@ -101,8 +114,8 @@ last_candle_tick_counter = 0
 current_expiry_date = None
 current_spot = 0.0
 current_future = 0.0
-current_iv_underlying = 0.0     # the price actually fed into Black-Scholes
-current_iv_underlying_mode = "SPOT"  # "SPOT" or "FUTURE", read from OptionChain!B7
+current_iv_underlying = 0.0
+current_iv_underlying_mode = "SPOT"
 current_atm_strike = 0.0
 current_atm_call_price = 0.0
 current_atm_put_price = 0.0
@@ -130,7 +143,6 @@ def convert_to_float(item):
 
 
 def nearest_strike(spot, step=50.0):
-    """Calculate the nearest strike price using the efficient method"""
     a = (spot // step) * step
     b = a + step
     return int(b if spot - a > b - spot else a)
@@ -147,16 +159,13 @@ def epoch_to_ist(epoch_time):
 
 
 def format_timestamp(ts_value):
-    """Return HH:MM:SS safely. Never return an Excel serial/date."""
     if ts_value is None or ts_value == "":
         return ""
     try:
         if isinstance(ts_value, (int, float, np.integer, np.floating)):
             x = float(ts_value)
-            # Unix epoch seconds only
             if x > 100000000:
                 return epoch_to_ist(x).strftime("%H:%M:%S")
-            # Excel serial time/day: convert only if clearly a fraction of a day
             if 0 <= x < 1:
                 total = int(round(x * 86400))
                 h = (total // 3600) % 24
@@ -176,7 +185,6 @@ def format_timestamp(ts_value):
                 return f"{(total//3600)%24:02d}:{(total%3600)//60:02d}:{total%60:02d}"
         except Exception:
             pass
-        # Handle HH:MM, HH:MM:SS, and minute:second formats.
         parts = s.split(":")
         if len(parts) == 3:
             h = int(float(parts[0])); m = int(float(parts[1])); sec = int(float(parts[2]))
@@ -191,7 +199,6 @@ def format_timestamp(ts_value):
     return ""
 
 def format_feed_datetime(ts_value):
-    """Return a real text datetime, never an Excel 1900 date."""
     if ts_value is None or ts_value == "":
         return ""
     try:
@@ -220,37 +227,25 @@ def format_feed_datetime(ts_value):
 def parse_date(date_input):
     if date_input is None:
         return None
-    
     if hasattr(date_input, 'date'):
         return date_input.date() if hasattr(date_input, 'date') else date_input
-    
     date_str = str(date_input).strip()
-    
     formats = [
-        '%d-%m-%Y',
-        '%Y-%m-%d',
-        '%d/%m/%Y',
-        '%Y/%m/%d',
-        '%d-%b-%Y',
-        '%d %b %Y',
-        '%d-%m-%y',
-        '%Y-%m-%d %H:%M:%S',
+        '%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y', '%Y/%m/%d',
+        '%d-%b-%Y', '%d %b %Y', '%d-%m-%y', '%Y-%m-%d %H:%M:%S',
     ]
-    
     for fmt in formats:
         try:
             return dt.strptime(date_str, fmt).date()
         except (ValueError, TypeError):
             continue
-    
     try:
         return pd.to_datetime(date_str).date()
     except:
-        raise ValueError(f"Unable to parse date: {date_str}")
+        raise ValueError(f"Unable to parse date: {date_input}")
 
 
 def get_field(token_key, field, default=0):
-    """Get a field from live_data with proper handling"""
     try:
         data = live_data.get(token_key, {})
         value = data.get(field, default)
@@ -262,52 +257,25 @@ def get_field(token_key, field, default=0):
 
 
 def _market_session_date(now_ist):
-    """Return the trading-session date the CURRENT market data actually
-    belongs to.
-
-    Shoonya's LTP/quote feed freezes at the last traded price whenever the
-    market is shut (weekends, before 9:15 AM), so a live option's price on a
-    Sunday is really Friday's close - it still has Friday's time value, not
-    Sunday's. Feeding wall-clock 'now' into the DTE calc on a non-trading
-    day/hour silently shortens T and inflates every IV. This walks the
-    valuation date back to the session the live prices actually reflect.
-    """
     d = now_ist.date()
     minutes_now = now_ist.hour * 60 + now_ist.minute
-
-    # Weekday before the market opens: still quoting yesterday's close.
     if now_ist.weekday() < 5 and minutes_now < MARKET_START:
         d -= timedelta(days=1)
-
-    # Roll back over weekends (Sat=5, Sun=6) to the prior trading day.
     while d.weekday() >= 5:
         d -= timedelta(days=1)
-
     return d
 
 
 def _nse_calendar_dte(expiry_date, valuation_dt=None):
-    """Return NSE-style observed calendar DTE.
-
-    NSE's public page documents the 10% rate and dynamic IV, but does not
-    publish the complete production time convention. For the supplied
-    expiry-day snapshot, using one calendar day on expiry day reproduces the
-    NSE IV scale (~6.8% for the 24,450 CE) instead of the ~39% produced by
-    using only the intraday hours remaining.
-    """
     if expiry_date is None:
         return 0
-
     if valuation_dt is None:
         valuation_dt = dt.now(IST).replace(tzinfo=None)
-
     today = valuation_dt.date() if hasattr(valuation_dt, "date") else valuation_dt
     try:
         dte = (expiry_date - today).days
     except Exception:
         return 0
-
-    # Expiry-day convention: keep a minimum of one calendar day.
     return max(1, int(dte))
 
 
@@ -334,41 +302,22 @@ def _bs_put_price(spot, strike, rate, T, sigma):
 
 
 def _solve_iv(option_price, pricing_function, lower_bound, upper_bound, intrinsic=0.0):
-    """Solve IV via scipy's brentq (validated against NSE's published IV in
-    IV_EXACT_MATCH.py - Brent's method root-find, same convention as NSE's
-    option-chain page: 10% rate, calendar-day T, spot/future underlying).
-    """
     if option_price <= 0:
         return 0.0
-
-    # An option trading at/below intrinsic value has no time value to solve
-    # a volatility from - mirrors IV_EXACT_MATCH.py's intrinsic check.
     if option_price <= intrinsic:
         return 0.0
-
-    # Market price must be inside the model's no-arbitrage range.
     if option_price < lower_bound - 1e-7 or option_price > upper_bound + 1e-7:
         return 0.0
-
     objective = lambda sigma: pricing_function(sigma) - option_price
     try:
         iv = brentq(objective, 1e-4, 5.0)
     except ValueError:
         return 0.0
-
     return iv * 100.0
 
 
 def init_iv_calculator(spot_ltp, future_ltp, atm_strike, atm_call_price, atm_put_price,
                         expiry_date, underlying_mode="SPOT"):
-    """Refresh the NSE IV engine with the current market snapshot.
-
-    underlying_mode selects which price is fed into Black-Scholes as S:
-      "SPOT"   -> raw index LTP (the old, only, behaviour)
-      "FUTURE" -> the NIFTY future LTP
-    Controlled live from OptionChain!B7 so you can A/B test against the
-    NSE page without editing code - see run_option_chain().
-    """
     global current_expiry_date, current_spot, current_future
     global current_atm_strike, current_atm_call_price, current_atm_put_price
     global current_iv_dte_days, current_iv_T, current_iv_timestamp
@@ -385,8 +334,6 @@ def init_iv_calculator(spot_ltp, future_ltp, atm_strike, atm_call_price, atm_put
     current_iv_underlying_mode = "FUTURE" if str(underlying_mode).strip().upper().startswith("F") else "SPOT"
     current_iv_underlying = current_future if current_iv_underlying_mode == "FUTURE" and current_future > 0 else current_spot
 
-    # DTE must be dated to the trading session the live prices belong to,
-    # not to wall-clock 'now' - see _market_session_date().
     session_date = _market_session_date(current_iv_timestamp)
     dte_valuation_dt = dt.combine(session_date, current_iv_timestamp.time())
     current_iv_dte_days = _nse_calendar_dte(expiry_date, dte_valuation_dt)
@@ -405,11 +352,6 @@ def init_iv_calculator(spot_ltp, future_ltp, atm_strike, atm_call_price, atm_put
 
 
 def calculate_iv_for_strike(strike_price, call_price, put_price):
-    """Calculate independent NSE-style CE IV and PE IV for one strike.
-
-    Prices off current_iv_underlying (set by init_iv_calculator from the
-    OptionChain!B7 SPOT/FUTURE toggle), not always raw spot.
-    """
     strike = convert_to_float(strike_price)
     call = convert_to_float(call_price)
     put = convert_to_float(put_price)
@@ -423,14 +365,11 @@ def calculate_iv_for_strike(strike_price, call_price, put_price):
 
     discount_factor = math.exp(-NSE_IV_RATE * current_iv_T)
 
-    # European Black-Scholes no-arbitrage bounds using NSE's 10% rate.
     call_lower = max(underlying - strike * discount_factor, 0.0)
     call_upper = underlying
     put_lower = max(strike * discount_factor - underlying, 0.0)
     put_upper = strike * discount_factor
 
-    # Simple (undiscounted) intrinsic value - same check IV_EXACT_MATCH.py
-    # uses to reject option prices with no time value before solving.
     call_intrinsic = max(underlying - strike, 0.0)
     put_intrinsic = max(strike - underlying, 0.0)
 
@@ -464,7 +403,6 @@ def calculate_iv_for_strike(strike_price, call_price, put_price):
 
 # ----------------------------------------------------------------------
 # Workbook setup
-
 # ----------------------------------------------------------------------
 def get_or_create_workbook():
     global AGGREGATION_INTERVAL, tick_counter
@@ -524,14 +462,11 @@ def get_or_create_workbook():
             oc_sheet.range("A7").value = "IV Underlying (SPOT/FUTURE) =>"
         if not oc_sheet.range("B7").value:
             oc_sheet.range("B7").value = "SPOT"
-        # Read aggregation interval from Excel
         agg_interval = oc_sheet.range("B4").value
         if agg_interval and isinstance(agg_interval, (int, float)) and agg_interval > 0:
             AGGREGATION_INTERVAL = int(agg_interval)
             print(f"✅ Aggregation interval set to {AGGREGATION_INTERVAL} minutes")
 
-    # CANONICAL Tick_History layout: exactly 31 columns A:AE.
-    # Keep this list defined even when the sheet already exists.
     headers = [
         "Feed Time", "Request Time", "Last Traded Time",
         "Spot", "ATM Strike", "OTM Call Strike",
@@ -544,19 +479,6 @@ def get_or_create_workbook():
         "PCR OI", "PCR Change OI"
     ]
 
-    # Canonical Tick_History headers MUST always be defined before any refresh.
-    # This fixes: "cannot access local variable headers" on existing workbooks.
-    headers = [
-        "Feed Time", "Request Time", "Last Traded Time",
-        "Spot", "ATM Strike", "OTM Call Strike",
-        "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI",
-        "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
-        "Call Bid", "Call Ask", "Call Bid-Ask Diff",
-        "OTM Put Strike", "Put LTP", "Put Volume", "Put IV", "Put OI", "Put Change OI",
-        "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
-        "Put Bid", "Put Ask", "Put Bid-Ask Diff", "PCR OI", "PCR Change OI"
-    ]
-
     history_sheet_name = "Tick_History"
     if history_sheet_name.lower() not in sheet_names:
         history_sheet = wb.sheets.add(history_sheet_name)
@@ -565,7 +487,6 @@ def get_or_create_workbook():
         tick_counter = 0
     else:
         history_sheet = wb.sheets[history_sheet_name]
-        # Check if headers exist, if not create them
         try:
             header_check = history_sheet.range("A1").value
             if header_check is None or header_check == "" or header_check != "Feed Time":
@@ -575,15 +496,12 @@ def get_or_create_workbook():
         except Exception as e:
             print(f"⚠️ Error checking headers: {e}")
 
-    # Always keep the Tick_History header structure current.
-    # This does not rewrite or delete existing tick data.
     try:
         history_sheet.range("A1:AE1").value = headers
         history_sheet.range("A:C").number_format = "@"
     except Exception as e:
         print(f"⚠️ Could not refresh Tick_History headers: {e}")
 
-    # Count existing rows in Tick_History
     try:
         history_last_row = get_last_actual_row(history_sheet, "A", 1)
         tick_counter = max(0, history_last_row - 1) if history_last_row >= 2 else 0
@@ -591,9 +509,6 @@ def get_or_create_workbook():
     except Exception:
         tick_counter = 0
 
-    # New sheet for aggregated candles - KEEP EXISTING DATA
-    # Reuse the existing candle sheet. Prefer the user's existing "Candel" sheet;
-    # otherwise reuse/create "Candles". Never create a second candle sheet on restart.
     if "candel" in sheet_names:
         candle_sheet_name = next(s.name for s in wb.sheets if s.name.lower() == "candel")
     elif "candles" in sheet_names:
@@ -602,7 +517,6 @@ def get_or_create_workbook():
         candle_sheet_name = "Candel"
     if candle_sheet_name.lower() not in sheet_names:
         candle_sheet = wb.sheets.add(candle_sheet_name)
-        # Create headers for new candle sheet with IV
         candle_headers = [
             "Time", "Close",
             "Call Strike", "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI", "Call Bid-Ask Avg",
@@ -615,7 +529,6 @@ def get_or_create_workbook():
         candle_sheet.range("A1").value = candle_headers
     else:
         candle_sheet = wb.sheets[candle_sheet_name]
-        # Check if headers exist
         try:
             header_check = candle_sheet.range("A1").value
             if header_check is None or header_check == "":
@@ -639,8 +552,6 @@ def get_or_create_workbook():
     except Exception:
         pass
 
-    # IMPORTANT: physically migrate old Candles data once.
-    # This fixes existing rows where Call Change OI was stored in Q.
     fix_candle_column_order(candle_sheet)
 
     print(
@@ -648,38 +559,214 @@ def get_or_create_workbook():
         f"Real Candles last row: {get_last_actual_row(candle_sheet, 'A', 1)}"
     )
 
+    # ============================================================
+    # RECOVERY: restore data if Excel is empty/missing/corrupt
+    # ============================================================
+    try:
+        restore_history_from_backup(history_sheet, candle_sheet)
+    except Exception as e:
+        print(f"⚠️ Restore attempt failed: {e}")
+
+    # Also create a NEW backup right now, so we always have a fresh snapshot
+    try:
+        backup_tick_history(history_sheet)
+        backup_candle_history(candle_sheet)
+    except Exception as e:
+        print(f"⚠️ Initial backup failed: {e}")
+
     wb.save()
     return wb, login_sheet, oc_sheet, history_sheet, candle_sheet
+
+
+# ----------------------------------------------------------------------
+# BACKUP FUNCTIONS - Parquet (primary) + Pickle (fallback)
+# ----------------------------------------------------------------------
+def _read_sheet_to_df(sheet, last_col="AE"):
+    """Read entire sheet into a DataFrame quickly via one COM call."""
+    try:
+        last_row = get_last_actual_row(sheet, "A", 1)
+        if last_row < 2:
+            return pd.DataFrame()
+        headers = sheet.range(f"A1:{last_col}1").value
+        data = sheet.range(f"A2:{last_col}{last_row}").value
+        if not data:
+            return pd.DataFrame()
+        if not isinstance(data[0], list):
+            data = [data]
+        return pd.DataFrame(data, columns=headers)
+    except Exception as e:
+        print(f"⚠️ Sheet read error: {e}")
+        return pd.DataFrame()
+
+
+def _save_backup_parquet(df, parquet_path, pkl_path):
+    """Save DataFrame to Parquet (primary) and Pickle (fallback)."""
+    if df is None or df.empty:
+        return False
+    try:
+        if USE_PARQUET:
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            pq.write_table(table, parquet_path, compression="snappy")
+        with open(pkl_path, "wb") as f:
+            pickle.dump(df, f, protocol=pickle.HIGHEST_PROTOCOL)
+        return True
+    except Exception as e:
+        print(f"⚠️ Backup save error: {e}")
+        try:
+            with open(pkl_path, "wb") as f:
+                pickle.dump(df, f, protocol=pickle.HIGHEST_PROTOCOL)
+            return True
+        except Exception as e2:
+            print(f"❌ Backup completely failed: {e2}")
+            return False
+
+
+def _load_backup(parquet_path, pkl_path):
+    """Load most recent backup. Try Parquet first, then Pickle."""
+    if USE_PARQUET and os.path.exists(parquet_path):
+        try:
+            table = pq.read_table(parquet_path)
+            return table.to_pandas()
+        except Exception as e:
+            print(f"⚠️ Parquet read failed ({e}); trying pickle...")
+    if os.path.exists(pkl_path):
+        try:
+            with open(pkl_path, "rb") as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"⚠️ Pickle read failed: {e}")
+    return pd.DataFrame()
+
+
+def backup_tick_history(history_sheet):
+    """Snapshot the entire Tick_History sheet to disk."""
+    df = _read_sheet_to_df(history_sheet, "AE")
+    if df.empty:
+        return False
+    ok = _save_backup_parquet(df, TICK_BACKUP_PARQUET, TICK_BACKUP_PKL)
+    if ok:
+        print(f"💾 Tick backup saved: {len(df)} rows → {os.path.basename(TICK_BACKUP_PARQUET)}")
+    return ok
+
+
+def backup_candle_history(candle_sheet):
+    """Snapshot the entire Candel sheet to disk."""
+    df = _read_sheet_to_df(candle_sheet, "Y")
+    if df.empty:
+        return False
+    ok = _save_backup_parquet(df, CANDLE_BACKUP_PARQUET, CANDLE_BACKUP_PKL)
+    if ok:
+        print(f"💾 Candle backup saved: {len(df)} rows → {os.path.basename(CANDLE_BACKUP_PARQUET)}")
+    return ok
+
+
+def restore_history_from_backup(history_sheet, candle_sheet):
+    """Called on startup. If sheets are empty/missing, restore from backup."""
+    try:
+        existing_ticks = get_last_actual_row(history_sheet, "A", 1)
+    except Exception:
+        existing_ticks = 1
+
+    if existing_ticks < 2:
+        df = _load_backup(TICK_BACKUP_PARQUET, TICK_BACKUP_PKL)
+        if not df.empty:
+            print(f"♻️ Restoring {len(df)} tick rows from backup...")
+            headers = [
+                "Feed Time", "Request Time", "Last Traded Time",
+                "Spot", "ATM Strike", "OTM Call Strike",
+                "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI",
+                "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
+                "Call Bid", "Call Ask", "Call Bid-Ask Diff",
+                "OTM Put Strike", "Put LTP", "Put Volume", "Put IV", "Put OI", "Put Change OI",
+                "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
+                "Put Bid", "Put Ask", "Put Bid-Ask Diff", "PCR OI", "PCR Change OI"
+            ]
+            try:
+                history_sheet.range("A1:AE1").value = headers
+                history_sheet.range("A:C").number_format = "@"
+                data_rows = df[headers].where(pd.notnull(df[headers]), None).values.tolist()
+                history_sheet.range(f"A2:AE{1+len(data_rows)}").value = data_rows
+                history_sheet.range("D2:AE1000000").number_format = "#,##0.00"
+                print(f"✅ Restored {len(data_rows)} tick rows into Excel")
+            except Exception as e:
+                print(f"⚠️ Tick restore write error: {e}")
+        else:
+            print("ℹ️ No tick backup found — starting fresh.")
+
+    try:
+        existing_candles = get_last_actual_row(candle_sheet, "A", 1)
+    except Exception:
+        existing_candles = 1
+
+    if existing_candles < 2:
+        df = _load_backup(CANDLE_BACKUP_PARQUET, CANDLE_BACKUP_PKL)
+        if not df.empty:
+            print(f"♻️ Restoring {len(df)} candle rows from backup...")
+            candle_headers = [
+                "Time", "Close",
+                "Call Strike", "Call LTP", "Call Volume", "Call IV", "Call OI",
+                "Call Change OI", "Call Bid-Ask Avg",
+                "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
+                "Put Strike", "Put LTP", "Put Volume", "Put IV", "Put OI",
+                "Put Change OI", "Put Bid-Ask Avg",
+                "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
+                "PCR OI", "PCR Change OI", "Ticks"
+            ]
+            try:
+                candle_sheet.range("A1:Y1").value = [candle_headers]
+                candle_sheet.range("A:A").number_format = "@"
+                df = df.reindex(columns=candle_headers)
+                data_rows = df.where(pd.notnull(df), None).values.tolist()
+                candle_sheet.range(f"A2:Y{1+len(data_rows)}").value = data_rows
+                candle_sheet.range("B2:Y1000000").number_format = "#,##0.00"
+                print(f"✅ Restored {len(data_rows)} candle rows into Excel")
+            except Exception as e:
+                print(f"⚠️ Candle restore write error: {e}")
+        else:
+            print("ℹ️ No candle backup found — starting fresh.")
+
+
+def daily_rolling_backup():
+    """Once per day, copy current backups into a dated snapshot."""
+    today = dt.now(IST).strftime("%Y-%m-%d")
+    for src in [TICK_BACKUP_PARQUET, CANDLE_BACKUP_PARQUET,
+                TICK_BACKUP_PKL, CANDLE_BACKUP_PKL]:
+        if os.path.exists(src):
+            stamp_path = src.replace(".", f"_{today}.")
+            if not os.path.exists(stamp_path):
+                try:
+                    shutil.copy2(src, stamp_path)
+                except Exception:
+                    pass
+    try:
+        for f in glob.glob(os.path.join(BACKUP_DIR, "*_202*.parquet")) + \
+                 glob.glob(os.path.join(BACKUP_DIR, "*_202*.pkl")):
+            if (dt.now(IST) - dt.fromtimestamp(os.path.getmtime(f), IST)).days > 7:
+                os.remove(f)
+    except Exception:
+        pass
 
 
 # ----------------------------------------------------------------------
 # Function to check Tick_History status
 # ----------------------------------------------------------------------
 def check_tick_history_status(history_sheet):
-    """Debug function to check Tick_History sheet status"""
     try:
         print("🔍 Checking Tick_History status...")
-        
-        # Check if sheet exists
         last_row = get_last_actual_row(history_sheet, "A", 1)
         print(f"   Used range rows: {last_row}")
-        
         if last_row >= 1:
-            # Check headers
             headers = history_sheet.range("A1:Z1").value
             if headers and any(headers):
                 print(f"   Headers found: {headers[0] if headers else 'None'}")
             else:
                 print("   No headers found!")
-        
-        # Check if there's data in row 2
         if last_row >= 2:
             row2_data = history_sheet.range("A2:Z2").value
             if row2_data and any(row2_data):
                 print(f"   Data found in row 2: {row2_data[0] if row2_data else 'None'}")
             else:
                 print("   No data found in row 2!")
-        
         print("✅ Tick_History status check complete")
         return True
     except Exception as e:
@@ -687,41 +774,27 @@ def check_tick_history_status(history_sheet):
         return False
 
 
-# ----------------------------------------------------------------------
-# Function to aggregate tick data into candles - UPDATED WITH IV
-# ----------------------------------------------------------------------
 def _parse_tick_datetime(value):
-    """Convert Tick_History Request Time into a real pandas datetime."""
     if value is None or value == "":
         return pd.NaT
-
-    # xlwings may return a real Python datetime.
     if isinstance(value, (dt, pd.Timestamp)):
         try:
             return pd.Timestamp(value)
         except Exception:
             return pd.NaT
-
-    # Excel may return a numeric Excel serial.
     if isinstance(value, (int, float, np.integer, np.floating)):
         try:
-            # Values around 1e9 are Unix timestamps; smaller values are Excel serials.
             if float(value) > 100000000:
                 return pd.to_datetime(float(value), unit="s", errors="coerce")
             return pd.to_datetime(float(value), unit="D", origin="1899-12-30", errors="coerce")
         except Exception:
             return pd.NaT
-
     s = str(value).strip()
     if not s or s.lower() == "none":
         return pd.NaT
-
-    # First try normal date/time parsing.
     ts = pd.to_datetime(s, errors="coerce", dayfirst=False)
     if not pd.isna(ts):
         return ts
-
-    # Old Tick_History versions may contain only HH:MM:SS.
     try:
         parsed_time = dt.strptime(s.split(".")[0], "%H:%M:%S").time()
         today = dt.now().date()
@@ -731,11 +804,6 @@ def _parse_tick_datetime(value):
 
 
 def _market_anchored_bin(ts, interval_minutes):
-    """
-    Return the candle start time anchored at 09:15.
-    This is important for 60-minute candles: they become 09:15, 10:15,
-    11:15... instead of pandas' normal 09:00, 10:00... bins.
-    """
     market_start = ts.normalize() + pd.Timedelta(hours=9, minutes=15)
     elapsed_seconds = (ts - market_start).total_seconds()
     bucket = int(elapsed_seconds // (interval_minutes * 60))
@@ -743,40 +811,13 @@ def _market_anchored_bin(ts, interval_minutes):
 
 
 def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
-    """
-    REAL-TIME candle updater.
-
-    IMPORTANT:
-    - Does NOT recalculate/write old candle rows.
-    - Only calculates the CURRENT candle from Tick_History.
-    - If the current minute is already the last candle row:
-        -> compare all 17 candle values
-        -> write that ONE row only if something changed.
-    - If a new minute starts:
-        -> append exactly ONE new row.
-    - Therefore rows 2..N are NEVER rewritten every refresh.
-    - No whole-sheet clear, no whole-history rewrite, no repeated appends.
-    """
     try:
         interval_minutes = max(1, int(interval_minutes))
-
-        # ------------------------------------------------------------
-        # READ TICK HISTORY
-        # We still read history to calculate the current candle,
-        # but we NEVER write historical candle rows again.
-        # ------------------------------------------------------------
         last_row = get_last_actual_row(history_sheet, "A", 1)
 
         if last_row < 2:
             return 0
 
-        # Only the ticks belonging to the CURRENT candle are needed here.
-        # Reading the entire Tick_History sheet on every refresh (the old
-        # behaviour) means this COM read + DataFrame build gets slower all
-        # day as history grows - it's the main reason things crawl by the
-        # afternoon. Bound the read to a recent window instead: generously
-        # more rows than any single interval could accumulate even at the
-        # fastest allowed refresh rate (0.05s -> ~1200 ticks/min).
         LOOKBACK_ROWS = max(500, interval_minutes * 1500)
         start_row = max(2, last_row - LOOKBACK_ROWS + 1)
 
@@ -785,7 +826,7 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         if not data_rows:
             return 0
         if data_rows and not isinstance(data_rows[0], list):
-            data_rows = [data_rows]  # xlwings flattens a single-row read
+            data_rows = [data_rows]
         df = pd.DataFrame(data_rows, columns=headers)
 
         required = [
@@ -800,9 +841,6 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
             print(f"⚠️ Tick_History missing columns: {missing}")
             return 0
 
-        # ------------------------------------------------------------
-        # PARSE / CLEAN
-        # ------------------------------------------------------------
         df["datetime"] = df["Request Time"].apply(_parse_tick_datetime)
 
         numeric_cols = [
@@ -813,10 +851,7 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         ]
 
         for col in numeric_cols:
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
-            ).fillna(0.0)
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
         df = df.dropna(subset=["datetime"])
         df = df[df["Spot"] > 0].copy()
@@ -826,32 +861,11 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
 
         df = df.sort_values("datetime").reset_index(drop=True)
 
-        # ------------------------------------------------------------
-        # RUN WINDOW
-        # ------------------------------------------------------------
-        # Tick_History has already been filtered by store_tick_data.
-        # Do not apply a second 15:30 cutoff here; otherwise the optional
-        # post-market candle window would always remain blank.
-
-        # ------------------------------------------------------------
-        # IMPORTANT:
-        # Find ONLY the latest/current candle.
-        # Do not build every historical candle.
-        # ------------------------------------------------------------
         latest_tick_time = df["datetime"].iloc[-1]
-
-        current_bin = _market_anchored_bin(
-            latest_tick_time,
-            interval_minutes
-        )
+        current_bin = _market_anchored_bin(latest_tick_time, interval_minutes)
 
         current_group = df[
-            df["datetime"].apply(
-                lambda x: _market_anchored_bin(
-                    x,
-                    interval_minutes
-                ) == current_bin
-            )
+            df["datetime"].apply(lambda x: _market_anchored_bin(x, interval_minutes) == current_bin)
         ].copy()
 
         if current_group.empty:
@@ -860,18 +874,8 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         current_group = current_group.sort_values("datetime")
         last = current_group.iloc[-1]
 
-        # ------------------------------------------------------------
-        # BUILD ONLY CURRENT CANDLE
-        # ------------------------------------------------------------
-        call_bid_ask = (
-            current_group["Call Ask"]
-            - current_group["Call Bid"]
-        ).mean()
-
-        put_bid_ask = (
-            current_group["Put Ask"]
-            - current_group["Put Bid"]
-        ).mean()
+        call_bid_ask = (current_group["Call Ask"] - current_group["Call Bid"]).mean()
+        put_bid_ask = (current_group["Put Ask"] - current_group["Put Bid"]).mean()
 
         call_buy = current_group["Call Total Buy"].sum()
         call_sell = current_group["Call Total Sell"].sum()
@@ -879,7 +883,6 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         put_buy = current_group["Put Total Buy"].sum()
         put_sell = current_group["Put Total Sell"].sum()
 
-        # Use 24-hour format. This avoids 02:xx / 14:xx confusion.
         candle_time = current_bin.strftime("%Y-%m-%d %H:%M")
 
         new_values = [
@@ -910,14 +913,8 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
             int(len(current_group)),
         ]
 
-        # ------------------------------------------------------------
-        # HEADERS ONLY IF MISSING
-        # NEVER REWRITE THEM EVERY REFRESH.
-        # Header row moved to row 1 - the "N-Minute Candle Data" title is
-        # dropped since that interval is already shown on OptionChain!B4.
-        # ------------------------------------------------------------
         candle_headers = [
-"Time", "Close",
+            "Time", "Close",
             "Call Strike", "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI", "Call Bid-Ask Avg",
             "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
             "Put Strike", "Put LTP", "Put Volume", "Put IV", "Put OI", "Put Change OI", "Put Bid-Ask Avg",
@@ -929,9 +926,7 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         try:
             current_headers = candle_sheet.range("A1:Y1").value
             if current_headers and isinstance(current_headers, list):
-                if len(current_headers) == 1 and isinstance(
-                    current_headers[0], list
-                ):
+                if len(current_headers) == 1 and isinstance(current_headers[0], list):
                     current_headers = current_headers[0]
         except Exception:
             current_headers = None
@@ -939,255 +934,110 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         if current_headers != candle_headers:
             candle_sheet.range("A1:Y1").value = [candle_headers]
 
-        # ------------------------------------------------------------
-        # FIND ONLY THE LAST CANDLE ROW
-        #
-        # We intentionally DO NOT read rows 2:N.
-        # Only the latest row matters.
-        # ------------------------------------------------------------
         try:
             candle_last_row = get_last_actual_row(candle_sheet, "A", 1)
         except Exception:
             candle_last_row = 1
 
         if candle_last_row < 2:
-            # No candle exists yet -> add the first one.
             target_row = 2
-
-            candle_sheet.range(
-                f"A{target_row}:Y{target_row}"
-            ).value = [new_values]
-
+            candle_sheet.range(f"A{target_row}:Y{target_row}").value = [new_values]
             candle_sheet.range(f"A{target_row}").number_format = "@"
-            candle_sheet.range(
-                f"B{target_row}:Y{target_row}"
-            ).number_format = "#,##0.00"
-
-            print(
-                f"🆕 Candle created: {candle_time}"
-            )
-
+            candle_sheet.range(f"B{target_row}:Y{target_row}").number_format = "#,##0.00"
+            print(f"🆕 Candle created: {candle_time}")
             return 1
 
-        # ------------------------------------------------------------
-        # READ ONLY THE LAST ROW
-        # ------------------------------------------------------------
-        last_row_values = candle_sheet.range(
-            f"A{candle_last_row}:Y{candle_last_row}"
-        ).value
+        last_row_values = candle_sheet.range(f"A{candle_last_row}:Y{candle_last_row}").value
 
         if last_row_values and isinstance(last_row_values, list):
-            if (
-                len(last_row_values) == 1
-                and isinstance(last_row_values[0], list)
-            ):
+            if len(last_row_values) == 1 and isinstance(last_row_values[0], list):
                 last_row_values = last_row_values[0]
         else:
             last_row_values = []
 
-        # ------------------------------------------------------------
-        # NORMALIZE TIME
-        # Excel can return datetime, string, or serial.
-        # Always convert it to YYYY-MM-DD HH:MM.
-        # ------------------------------------------------------------
         def normalize_candle_time(value):
             if value is None or value == "":
                 return ""
-
             if isinstance(value, (dt, pd.Timestamp)):
-                return pd.Timestamp(value).strftime(
-                    "%Y-%m-%d %H:%M"
-                )
-
+                return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M")
             if isinstance(value, (int, float, np.integer, np.floating)):
                 try:
-                    # Excel datetime serial
-                    parsed = pd.to_datetime(
-                        float(value),
-                        unit="D",
-                        origin="1899-12-30",
-                        errors="coerce"
-                    )
-
+                    parsed = pd.to_datetime(float(value), unit="D", origin="1899-12-30", errors="coerce")
                     if not pd.isna(parsed):
-                        return parsed.strftime(
-                            "%Y-%m-%d %H:%M"
-                        )
+                        return parsed.strftime("%Y-%m-%d %H:%M")
                 except Exception:
                     pass
-
             s = str(value).strip()
-
-            # Try common datetime formats.
             for fmt in (
-                "%Y-%m-%d %H:%M",
-                "%Y-%m-%d %H:%M:%S",
-                "%d/%m/%Y %H:%M",
-                "%d/%m/%Y %H:%M:%S",
-                "%m/%d/%Y %H:%M",
-                "%m/%d/%Y %H:%M:%S",
-                "%Y-%m-%d %I:%M",
-                "%d/%m/%Y %I:%M",
-                "%m/%d/%Y %I:%M",
+                "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S",
+                "%m/%d/%Y %H:%M", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d %I:%M", "%d/%m/%Y %I:%M", "%m/%d/%Y %I:%M",
             ):
                 try:
-                    return dt.strptime(
-                        s,
-                        fmt
-                    ).strftime(
-                        "%Y-%m-%d %H:%M"
-                    )
+                    return dt.strptime(s, fmt).strftime("%Y-%m-%d %H:%M")
                 except Exception:
                     pass
-
-            # Final pandas parser.
             try:
-                parsed = pd.to_datetime(
-                    s,
-                    errors="coerce",
-                    dayfirst=False
-                )
-
+                parsed = pd.to_datetime(s, errors="coerce", dayfirst=False)
                 if not pd.isna(parsed):
-                    return pd.Timestamp(parsed).strftime(
-                        "%Y-%m-%d %H:%M"
-                    )
+                    return pd.Timestamp(parsed).strftime("%Y-%m-%d %H:%M")
             except Exception:
                 pass
-
             return s
 
-        existing_time = normalize_candle_time(
-            last_row_values[0] if last_row_values else None
-        )
+        existing_time = normalize_candle_time(last_row_values[0] if last_row_values else None)
 
-        # ------------------------------------------------------------
-        # CASE 1:
-        # SAME MINUTE -> compare ONLY this row.
-        # ------------------------------------------------------------
         if existing_time == candle_time:
-
             def values_equal(old, new):
                 if old is None and new is None:
                     return True
-
                 if old is None or new is None:
                     return False
-
                 try:
                     old_f = float(old)
                     new_f = float(new)
-
-                    if (
-                        math.isfinite(old_f)
-                        and math.isfinite(new_f)
-                    ):
+                    if math.isfinite(old_f) and math.isfinite(new_f):
                         return abs(old_f - new_f) <= 1e-9
-
                 except Exception:
                     pass
-
                 return str(old).strip() == str(new).strip()
 
             changed = False
-
-            for old, new in zip(
-                last_row_values,
-                new_values
-            ):
+            for old, new in zip(last_row_values, new_values):
                 if not values_equal(old, new):
                     changed = True
                     break
 
             if not changed:
-                # NOTHING changed.
-                # ZERO Excel writes.
                 return 0
 
-            # One row ONLY.
-            candle_sheet.range(
-                f"A{candle_last_row}:Y{candle_last_row}"
-            ).value = [new_values]
-
-            candle_sheet.range(
-                f"B{candle_last_row}:S{candle_last_row}"
-            ).number_format = "#,##0.00"
-
-            print(
-                f"🔄 Updated ONLY current candle: "
-                f"{candle_time}"
-            )
-
+            candle_sheet.range(f"A{candle_last_row}:Y{candle_last_row}").value = [new_values]
+            candle_sheet.range(f"B{candle_last_row}:S{candle_last_row}").number_format = "#,##0.00"
+            print(f"🔄 Updated ONLY current candle: {candle_time}")
             return 1
 
-        # ------------------------------------------------------------
-        # CASE 2:
-        # NEW MINUTE -> append exactly ONE row.
-        # ------------------------------------------------------------
         target_row = candle_last_row + 1
-
-        candle_sheet.range(
-            f"A{target_row}:Y{target_row}"
-        ).value = [new_values]
-
-        candle_sheet.range(
-            f"B{target_row}:S{target_row}"
-        ).number_format = "#,##0.00"
-
-        print(
-            f"🆕 New candle added ONLY: "
-            f"{candle_time}"
-        )
-
+        candle_sheet.range(f"A{target_row}:Y{target_row}").value = [new_values]
+        candle_sheet.range(f"B{target_row}:S{target_row}").number_format = "#,##0.00"
+        print(f"🆕 New candle added ONLY: {candle_time}")
         return 1
 
     except Exception as e:
-        print(
-            f"⚠️ Error updating current candle: {e}"
-        )
+        print(f"⚠️ Error updating current candle: {e}")
         import traceback
         traceback.print_exc()
         return 0
 
 
-
-
-# ----------------------------------------------------------------------
-# FIND LAST REAL DATA ROW
-# ----------------------------------------------------------------------
 def get_last_actual_row(sheet, column="A", header_row=1):
-    """
-    Returns the last row containing REAL content in the specified column.
-
-    IMPORTANT:
-    Do NOT use sheet.get_last_actual_row(...) for data positioning.
-    Excel's used range can include old formatting, colors, borders, etc.
-    That can create huge blank gaps such as writing Candles at row 274
-    or Tick_History at row 1344.
-
-    Column A is used because:
-      Tick_History -> Feed Time is column A
-      Candles      -> Time is column A
-    """
     try:
         max_row = sheet.cells.last_cell.row
         last = sheet.range(f"{column}{max_row}").end("up").row
-
-        # Never return a row above the header.
         return max(int(last), int(header_row))
     except Exception:
         return int(header_row)
 
 
-# ----------------------------------------------------------------------
-# FIX / MIGRATE EXISTING CANDLES SHEET
-# ----------------------------------------------------------------------
 def fix_candle_column_order(candle_sheet):
-    """Ensure one canonical 25-column Candel/Candles layout.
-
-    Old candle files had 21 columns. New files include Call/Put LTP and
-    Volume, so we migrate old rows without creating another sheet.
-    """
     headers = [
         "Time", "Close",
         "Call Strike", "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI",
@@ -1212,7 +1062,6 @@ def fix_candle_column_order(candle_sheet):
             print("✅ Candles column order already correct.")
             return
 
-        # Old 21-column layout from the previous working versions.
         old_headers = [
             "Time", "Close", "Call Strike", "Call IV", "Call OI", "Call Bid-Ask Avg",
             "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff", "Put Strike", "Put IV",
@@ -1225,7 +1074,6 @@ def fix_candle_column_order(candle_sheet):
             migrated = []
             for row in data:
                 r = list(row) + [None] * max(0, 21-len(row))
-                # We cannot recover historical LTP/Volume if they were never stored.
                 migrated.append([
                     r[0], r[1], r[2], 0.0, 0.0, r[3], r[4], r[16], r[5],
                     r[6], r[7], r[8], r[9], 0.0, 0.0, r[10], r[11], r[17],
@@ -1237,7 +1085,6 @@ def fix_candle_column_order(candle_sheet):
                 candle_sheet.range(f"A2:Y{1+len(migrated)}").value = migrated
             print(f"🔧 Migrated {len(migrated)} old candle rows to canonical LTP/Volume layout.")
         else:
-            # Unknown/malformed header: fix only the header; do not create a sheet.
             candle_sheet.range("A1:Y1").value = [headers]
             print("🔧 Repaired Candel headers to canonical 25-column layout.")
 
@@ -1247,30 +1094,17 @@ def fix_candle_column_order(candle_sheet):
         print(f"⚠️ Candles column migration error: {e}")
 
 
-# ----------------------------------------------------------------------
-# Function to get all login data from Excel
-# ----------------------------------------------------------------------
 def get_all_login_data(login_sheet):
     data = login_sheet.range("A1:B30").value
-    
     login_data = {
-        'client_id': '',
-        'user_id': '',
-        'password': '',
-        'totp_secret': '',
-        'secret_code': '',
-        'auth_code': '',
-        'token': '',
-        'usertoken': '',
-        'ip_address': '',
-        'token_timestamp': None
+        'client_id': '', 'user_id': '', 'password': '', 'totp_secret': '',
+        'secret_code': '', 'auth_code': '', 'token': '', 'usertoken': '',
+        'ip_address': '', 'token_timestamp': None
     }
-    
     for row in data:
         if row and len(row) >= 2:
             field = str(row[0]).strip().upper() if row[0] else ""
             value = str(row[1]).strip() if row[1] else ""
-            
             if "CLIENT_ID" in field:
                 login_data['client_id'] = value
             elif "USER_ID" in field:
@@ -1294,27 +1128,22 @@ def get_all_login_data(login_sheet):
                     login_data['token_timestamp'] = dt.strptime(value, '%Y-%m-%d %H:%M:%S')
                 except:
                     pass
-    
     if not login_data['client_id'] and login_data['user_id']:
         login_data['client_id'] = f"{login_data['user_id']}_U"
-    
     return login_data
 
 
 def update_login_data(login_sheet, auth_code, token, usertoken):
     data = login_sheet.range("A1:B30").value
-    
     for i, row in enumerate(data):
         if row and len(row) >= 2:
             field = str(row[0]).strip().upper() if row[0] else ""
-            
             if "AUTH CODE" in field:
                 login_sheet.range(f"B{i+1}").value = auth_code
             elif "TOKEN" in field and "USERTOKEN" not in field and "TIMESTAMP" not in field:
                 login_sheet.range(f"B{i+1}").value = token
             elif "USERTOKEN" in field:
                 login_sheet.range(f"B{i+1}").value = usertoken
-    
     current_time = dt.now().strftime('%Y-%m-%d %H:%M:%S')
     timestamp_exists = False
     for i, row in enumerate(data):
@@ -1324,25 +1153,21 @@ def update_login_data(login_sheet, auth_code, token, usertoken):
                 login_sheet.range(f"B{i+1}").value = current_time
                 timestamp_exists = True
                 break
-    
     if not timestamp_exists:
         last_row = len(data) + 1
         login_sheet.range(f"A{last_row}").value = "TOKEN_TIMESTAMP"
         login_sheet.range(f"B{last_row}").value = current_time
-    
     login_sheet.book.save()
 
 
 def is_token_valid(login_data):
     if not login_data['auth_code'] or not login_data['token'] or not login_data['usertoken']:
         return False, "Missing tokens"
-    
     if login_data['token_timestamp']:
         token_age = (dt.now() - login_data['token_timestamp']).total_seconds() / 3600
         if token_age > 24:
             return False, f"Tokens are {token_age:.1f} hours old (expired)"
         print(f"   Tokens are {token_age:.1f} hours old")
-    
     try:
         class TestApi(NorenApi):
             def __init__(self):
@@ -1350,20 +1175,16 @@ def is_token_valid(login_data):
                     host="https://api.shoonya.com/NorenWClientAPI/",
                     websocket="wss://api.shoonya.com/NorenWSAPI/",
                 )
-        
         test_api = TestApi()
         test_api.uid = login_data['usertoken']
         test_api.token = login_data['token']
         test_api.actid = login_data['user_id']
-        
         test_response = test_api.get_quotes(SPOT_EXCHANGE, str(NIFTY_SPOT_TOKEN))
-        
         if test_response and 'lp' in test_response:
             print(f"   ✅ Token validation successful! Spot: {test_response.get('lp')}")
             return True, "Valid token"
         else:
             return False, "Token validation failed - no data received"
-            
     except Exception as e:
         error_msg = str(e)
         if "invalid token" in error_msg.lower() or "expired" in error_msg.lower():
@@ -1371,9 +1192,6 @@ def is_token_valid(login_data):
         return False, f"Token validation error: {error_msg[:50]}"
 
 
-# ----------------------------------------------------------------------
-# Selenium: fetch OAuth auth code
-# ----------------------------------------------------------------------
 def get_auth_code_via_selenium(client_id, user_id, password, totp_secret):
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -1415,9 +1233,6 @@ def get_auth_code_via_selenium(client_id, user_id, password, totp_secret):
         driver.quit()
 
 
-# ----------------------------------------------------------------------
-# OAuth login with existing token check
-# ----------------------------------------------------------------------
 def _make_api():
     class ShoonyaApiPy(NorenApi):
         def __init__(self):
@@ -1429,7 +1244,6 @@ def _make_api():
 
 
 def _load_saved_session(login_data):
-    """Load the saved token without calling any validation REST API."""
     global api
     if not login_data.get("token") or not login_data.get("usertoken"):
         return False
@@ -1473,7 +1287,6 @@ def _login_from_auth_code(login_sheet, login_data, auth_code):
 
 
 def shoonya_login(login_sheet):
-    """Login order: saved TOKEN -> saved AUTH CODE -> browser only if AUTH CODE returns None."""
     global api
     login_data = get_all_login_data(login_sheet)
 
@@ -1493,7 +1306,6 @@ def shoonya_login(login_sheet):
         if _login_from_auth_code(login_sheet, login_data, login_data["auth_code"]):
             return True
 
-    # Only this path is allowed to generate a new auth code.
     print("⚠️ Saved AUTH CODE returned None/failed.")
     print("🔄 NOW and ONLY NOW opening browser for a fresh OAuth code...")
     if not login_data.get("password") or not login_data.get("totp_secret"):
@@ -1511,12 +1323,8 @@ def shoonya_login(login_sheet):
     return _login_from_auth_code(login_sheet, login_data, auth_code)
 
 
-# ----------------------------------------------------------------------
-# WebSocket callbacks
-# ----------------------------------------------------------------------
 def event_handler_quote_update(msg):
     global live_data, feed_time, last_traded_time
-    
     fields = ["ts", "lp", "pc", "c", "o", "h", "l", "v", "ltq", "ltp",
               "bp1", "sp1", "bq1", "sq1", "ap", "oi", "poi", "toi",
               "tbq", "tsq", "ft", "exch_tm", "ltt"]
@@ -1524,8 +1332,6 @@ def event_handler_quote_update(msg):
     key = msg["e"] + "|" + msg["tk"]
     live_data[key] = {**live_data.get(key, {}), **message}
     
-    # IMPORTANT: Shoonya field `ts` is the trading symbol (for example Nifty 50),
-    # NOT a timestamp. Never put `ts` into Feed Time or Last Traded Time.
     if 'ft' in msg:
         _ft = format_feed_datetime(msg['ft'])
         if _ft:
@@ -1535,7 +1341,6 @@ def event_handler_quote_update(msg):
         if _ft:
             feed_time = _ft
 
-    # Last Traded Time comes only from ltt.
     if 'ltt' in msg:
         _ltt = format_timestamp(msg['ltt'])
         if _ltt:
@@ -1563,9 +1368,6 @@ def subscribe_token(exchange, token):
     api.subscribe([f"{exchange}|{token}"])
 
 
-# ----------------------------------------------------------------------
-# Instrument loading
-# ----------------------------------------------------------------------
 def load_instruments():
     global df_ins_NSE, df_ins_NFO
 
@@ -1631,9 +1433,6 @@ def dump_available_expiries(oc_sheet):
 
 
 def _nearest_upcoming_expiry(today=None):
-    """Return the nearest expiry date >= today from the loaded NIFTY chain
-    (falls back to the nearest overall expiry if every listed one has
-    already passed)."""
     if today is None:
         today = dt.now(IST).date()
     matches = [t for t in OptionChain_template if t["symbol"] == SYMBOL]
@@ -1647,17 +1446,12 @@ def _nearest_upcoming_expiry(today=None):
 
 
 def _auto_select_expiry_if_blank(oc_sheet, announce=True):
-    """If B1 (Expiry) is empty, fill it with the nearest upcoming expiry so
-    the tool can run without requiring a manual date first. Returns the
-    (possibly auto-filled) expiry string currently in B1."""
     expiry_str = oc_sheet.range("B1").value
     if expiry_str:
         return expiry_str
-
     nearest = _nearest_upcoming_expiry()
     if nearest is None:
         return expiry_str
-
     expiry_str = nearest.strftime("%d-%m-%Y")
     oc_sheet.range("B1").value = expiry_str
     if announce:
@@ -1666,8 +1460,6 @@ def _auto_select_expiry_if_blank(oc_sheet, announce=True):
 
 
 def _report_blank_config_cells(oc_sheet):
-    """Print which of the core config cells (B1-B4) are currently blank, so
-    it's obvious from the console why defaults are being used."""
     cell_labels = {
         "B1": "Expiry (dd-mm-yyyy)",
         "B2": "NoOfStrikes each side",
@@ -1682,109 +1474,56 @@ def _report_blank_config_cells(oc_sheet):
         print("✅ B1-B4 config cells are all filled in.")
 
 
-# ============================================================
-# ATM HIGHLIGHT - GREEN BACKGROUND
-# ============================================================
 _last_atm_highlight_row = None
 
-
 def apply_atm_highlight(oc_sheet, row_num):
-    """Highlight the ATM row in the OptionChain data area.
-
-    OptionChain headers are on row 10 and data starts on row 11.
-    row_num is computed by the caller directly from atm_idx/lo (it already
-    knows exactly which row ATM lands on) instead of clearing and reading
-    a 990x27 block back from Excel every refresh just to find it again.
-    Only the previous highlighted row (if it moved) and the new one are
-    touched - two small COM calls instead of two full-block ones.
-    """
     global _last_atm_highlight_row
     try:
         if row_num == _last_atm_highlight_row:
-            return  # ATM strike hasn't moved rows - nothing to do
-
+            return
         if _last_atm_highlight_row is not None:
             oc_sheet.range(f"A{_last_atm_highlight_row}:AA{_last_atm_highlight_row}").color = None
-
         oc_sheet.range(f"A{row_num}:AA{row_num}").color = (0, 255, 0)
         _last_atm_highlight_row = row_num
-
     except Exception as e:
         print(f"⚠️ ATM highlight error: {e}")
 
-# ----------------------------------------------------------------------
-# Function to get first OTM Call and Put strikes
-# ----------------------------------------------------------------------
+
 def get_first_otm_strikes(df_full, spot_ltp, atm_strike, strike_step=50):
-    """Get the first OTM Call (strike ABOVE spot) and first OTM Put (strike BELOW spot)
-    from the FULL dataframe before trimming"""
-    
-    # Get all unique strikes from the FULL dataframe
     strikes = sorted(df_full["strike"].unique())
-    
-    # Find OTM Call (strike ABOVE spot, closest to spot) - LEFT side of Option Chain
     otm_call_strike = None
-    
     for strike in strikes:
         if strike > spot_ltp:
             otm_call_strike = strike
             break
-    
-    # If no OTM Call found above spot, use ATM + step
     if otm_call_strike is None:
         otm_call_strike = atm_strike + strike_step
-        # Find the closest strike above ATM
         for strike in strikes:
             if strike > atm_strike:
                 otm_call_strike = strike
                 break
-    
-    # Find OTM Put (strike BELOW spot, closest to spot) - RIGHT side of Option Chain
     otm_put_strike = None
-    
     for strike in reversed(strikes):
         if strike < spot_ltp:
             otm_put_strike = strike
             break
-    
-    # If no OTM Put found below spot, use ATM - step
     if otm_put_strike is None:
         otm_put_strike = atm_strike - strike_step
-        # Find the closest strike below ATM
         for strike in reversed(strikes):
             if strike < atm_strike:
                 otm_put_strike = strike
                 break
-    
     return otm_call_strike, otm_put_strike
 
 
-# ----------------------------------------------------------------------
-# Function to store data in history sheet - APPEND new data WITH IV
-# ----------------------------------------------------------------------
 def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strike, otm_put_strike, expiry_input, future_ltp, atm_call_price, atm_put_price):
-    """
-    Store a market snapshot in Tick_History.
-
-    IMPORTANT:
-    1. Never write after 23:59 IST.
-    2. Never write the same market snapshot twice.
-       Request Time / Feed Time are NOT part of duplicate detection.
-    3. If ANY real market value changes (Spot, OI, IV, Bid, Ask,
-       Buy/Sell, strike, etc.), a new row is written.
-    """
     global tick_counter, feed_time, request_time, last_traded_time
     global last_tick_signature
 
     try:
-        # ============================================================
-        # MARKET-CLOSE PROTECTION
-        # ============================================================
         now_ist = dt.now(IST)
         market_minutes = now_ist.hour * 60 + now_ist.minute
 
-        # Normal market is always allowed. After-market can be enabled
-        # from OptionChain!B5 and stopped at OptionChain!B6.
         if market_minutes < MARKET_START:
             return
 
@@ -1799,11 +1538,7 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
         now_dt = now_ist.replace(tzinfo=None)
         request_time = now_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-        # ------------------------------------------------------------
-        # Find OTM Call (above/equal ATM)
-        # ------------------------------------------------------------
         otm_call_row = df_full[df_full["strike"] == otm_call_strike]
-
         if otm_call_row.empty:
             df_above_spot = df_full[df_full["strike"] > spot_ltp]
             if not df_above_spot.empty:
@@ -1812,11 +1547,7 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
             else:
                 return
 
-        # ------------------------------------------------------------
-        # Find OTM Put (below/equal ATM)
-        # ------------------------------------------------------------
         otm_put_row = df_full[df_full["strike"] == otm_put_strike]
-
         if otm_put_row.empty:
             df_below_spot = df_full[df_full["strike"] < spot_ltp]
             if not df_below_spot.empty:
@@ -1831,9 +1562,6 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
         call_data = otm_call_row.iloc[0]
         put_data = otm_put_row.iloc[0]
 
-        # ------------------------------------------------------------
-        # Calculate IV independently at each option's own strike
-        # ------------------------------------------------------------
         call_iv = 0.0
         put_iv = 0.0
 
@@ -1842,35 +1570,18 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
                 call_same = df_full[df_full["strike"] == otm_call_strike]
                 if not call_same.empty:
                     r = call_same.iloc[0]
-                    call_iv, _ = calculate_iv_for_strike(
-                        otm_call_strike,
-                        r.get("CE_lp", 0),
-                        r.get("PE_lp", 0)
-                    )
+                    call_iv, _ = calculate_iv_for_strike(otm_call_strike, r.get("CE_lp", 0), r.get("PE_lp", 0))
 
                 put_same = df_full[df_full["strike"] == otm_put_strike]
                 if not put_same.empty:
                     r = put_same.iloc[0]
-                    _, put_iv = calculate_iv_for_strike(
-                        otm_put_strike,
-                        r.get("CE_lp", 0),
-                        r.get("PE_lp", 0)
-                    )
+                    _, put_iv = calculate_iv_for_strike(otm_put_strike, r.get("CE_lp", 0), r.get("PE_lp", 0))
             except Exception as e:
                 print(f"⚠️ OTM IV calculation error: {e}")
 
         call_iv = round(call_iv, 2)
         put_iv = round(put_iv, 2)
 
-        # ------------------------------------------------------------
-        # Build market-data portion of the row.
-        # IMPORTANT: columns A-C (time fields) are excluded from the
-        # duplicate signature because they naturally change each refresh.
-        # Everything from Spot through Put Bid-Ask Diff is compared.
-        # ------------------------------------------------------------
-        # PCR is calculated ONLY for the selected OTM strikes in this row.
-        # PCR OI        = OTM Put OI / OTM Call OI
-        # PCR Change OI = OTM Put Change OI / OTM Call Change OI
         call_oi = convert_to_float(call_data.get("CE_oi", 0))
         put_oi = convert_to_float(put_data.get("PE_oi", 0))
         call_chg_oi = convert_to_float(call_data.get("CE_coi", 0))
@@ -1880,68 +1591,40 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
         pcr_change_oi = (put_chg_oi / call_chg_oi) if call_chg_oi != 0 else 0.0
 
         market_values = [
-            convert_to_float(spot_ltp),
-            convert_to_float(atm_strike),
-            convert_to_float(otm_call_strike),
-            convert_to_float(call_data.get("CE_lp", 0)),
-            convert_to_float(call_data.get("CE_v", 0)),
-            call_iv,
-            convert_to_float(call_data.get("CE_oi", 0)),
-            convert_to_float(call_data.get("CE_coi", 0)),
-            convert_to_float(call_data.get("CE_total_buy", 0)),
-            convert_to_float(call_data.get("CE_total_sell", 0)),
-            convert_to_float(call_data.get("CE_total_buy", 0)) -
-            convert_to_float(call_data.get("CE_total_sell", 0)),
-            convert_to_float(call_data.get("CE_bp1", 0)),
-            convert_to_float(call_data.get("CE_sp1", 0)),
-            convert_to_float(call_data.get("CE_sp1", 0)) -
-            convert_to_float(call_data.get("CE_bp1", 0)),
-            convert_to_float(otm_put_strike),
-            convert_to_float(put_data.get("PE_lp", 0)),
-            convert_to_float(put_data.get("PE_v", 0)),
-            put_iv,
-            convert_to_float(put_data.get("PE_oi", 0)),
-            convert_to_float(put_data.get("PE_coi", 0)),
-            convert_to_float(put_data.get("PE_total_buy", 0)),
-            convert_to_float(put_data.get("PE_total_sell", 0)),
-            convert_to_float(put_data.get("PE_total_buy", 0)) -
-            convert_to_float(put_data.get("PE_total_sell", 0)),
-            convert_to_float(put_data.get("PE_bp1", 0)),
-            convert_to_float(put_data.get("PE_sp1", 0)),
-            convert_to_float(put_data.get("PE_sp1", 0)) -
-            convert_to_float(put_data.get("PE_bp1", 0)),
-            pcr_oi,
-            pcr_change_oi,
+            convert_to_float(spot_ltp), convert_to_float(atm_strike), convert_to_float(otm_call_strike),
+            convert_to_float(call_data.get("CE_lp", 0)), convert_to_float(call_data.get("CE_v", 0)), call_iv,
+            convert_to_float(call_data.get("CE_oi", 0)), convert_to_float(call_data.get("CE_coi", 0)),
+            convert_to_float(call_data.get("CE_total_buy", 0)), convert_to_float(call_data.get("CE_total_sell", 0)),
+            convert_to_float(call_data.get("CE_total_buy", 0)) - convert_to_float(call_data.get("CE_total_sell", 0)),
+            convert_to_float(call_data.get("CE_bp1", 0)), convert_to_float(call_data.get("CE_sp1", 0)),
+            convert_to_float(call_data.get("CE_sp1", 0)) - convert_to_float(call_data.get("CE_bp1", 0)),
+            convert_to_float(otm_put_strike), convert_to_float(put_data.get("PE_lp", 0)),
+            convert_to_float(put_data.get("PE_v", 0)), put_iv,
+            convert_to_float(put_data.get("PE_oi", 0)), convert_to_float(put_data.get("PE_coi", 0)),
+            convert_to_float(put_data.get("PE_total_buy", 0)), convert_to_float(put_data.get("PE_total_sell", 0)),
+            convert_to_float(put_data.get("PE_total_buy", 0)) - convert_to_float(put_data.get("PE_total_sell", 0)),
+            convert_to_float(put_data.get("PE_bp1", 0)), convert_to_float(put_data.get("PE_sp1", 0)),
+            convert_to_float(put_data.get("PE_sp1", 0)) - convert_to_float(put_data.get("PE_bp1", 0)),
+            pcr_oi, pcr_change_oi,
         ]
 
-        # ------------------------------------------------------------
-        # DUPLICATE SNAPSHOT PROTECTION
-        # ------------------------------------------------------------
-        # Convert to a stable tuple. Rounded numeric values prevent tiny
-        # floating-point representation differences from creating fake ticks.
         signature = tuple(
             round(float(v), 8) if isinstance(v, (int, float, np.number)) else str(v)
             for v in market_values
         )
 
         if last_tick_signature == signature:
-            # Same market data as the last row. Do NOT write another row.
             return
 
-        # ------------------------------------------------------------
-        # Timestamp fields are only created AFTER duplicate check.
-        # ------------------------------------------------------------
         if not feed_time:
             feed_time = now_dt.strftime("%H:%M:%S")
         if not last_traded_time or last_traded_time in ("Nifty 50", "NIFTY 50"):
             last_traded_time = feed_time if feed_time else now_dt.strftime("%H:%M:%S")
 
-        # Use current exchange/feed timestamp when available; otherwise
-        # keep the existing value maintained by the main loop.
         headers = [
             "Feed Time", "Request Time", "Last Traded Time",
-            "Spot", "ATM Strike",
-            "OTM Call Strike", "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI",
+            "Spot", "ATM Strike", "OTM Call Strike",
+            "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI",
             "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
             "Call Bid", "Call Ask", "Call Bid-Ask Diff",
             "OTM Put Strike", "Put LTP", "Put Volume", "Put IV", "Put OI", "Put Change OI",
@@ -1950,7 +1633,6 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
             "PCR OI", "PCR Change OI"
         ]
 
-        # Ensure headers exist.
         try:
             if history_sheet.range("A1").value != "Feed Time":
                 history_sheet.range("A1:AE1").value = headers
@@ -1958,47 +1640,43 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
         except Exception:
             history_sheet.range("A1:AE1").value = headers
 
-        row_data = [
-            feed_time,
-            now_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            last_traded_time,
-            *market_values,
-        ]
+        row_data = [feed_time, now_dt.strftime("%Y-%m-%d %H:%M:%S"), last_traded_time, *market_values]
 
-        # ------------------------------------------------------------
-        # APPEND EXACTLY ONE NEW ROW
-        # ------------------------------------------------------------
         try:
             last_row = get_last_actual_row(history_sheet, "A", 1)
             next_row = max(2, last_row + 1)
         except Exception:
             next_row = tick_counter + 2
 
-        # Force all three time columns to TEXT before writing. This prevents
-        # Excel from converting 20:03:46 into the 1900 date system.
         history_sheet.range(f"A{next_row}:C{next_row}").number_format = "@"
-        history_sheet.range(f"A{next_row}:C{next_row}").value = [[
-            str(row_data[0] or ""),
-            str(row_data[1] or ""),
-            str(row_data[2] or ""),
-        ]]
+        history_sheet.range(f"A{next_row}:C{next_row}").value = [[str(row_data[0] or ""), str(row_data[1] or ""), str(row_data[2] or "")]]
         history_sheet.range(f"D{next_row}:AE{next_row}").number_format = "#,##0.00"
         history_sheet.range(f"D{next_row}:AE{next_row}").value = [[*row_data[3:]]]
 
         tick_counter += 1
         last_tick_signature = signature
 
-        # Autofit only occasionally; never every refresh.
         if tick_counter == 1 or tick_counter % 50 == 0:
             try:
                 history_sheet.autofit()
             except Exception:
                 pass
 
-        print(
-            f"✅ Tick {tick_counter} written at row {next_row} | "
-            f"{now_dt.strftime('%H:%M:%S')} | Spot={market_values[0]:.2f}"
-        )
+        print(f"✅ Tick {tick_counter} written at row {next_row} | {now_dt.strftime('%H:%M:%S')} | Spot={market_values[0]:.2f}")
+
+        # ============================================================
+        # AUTO-BACKUP every N ticks (Parquet + Pickle)
+        # ============================================================
+        global _last_tick_backup_count
+        if tick_counter - _last_tick_backup_count >= BACKUP_EVERY_N_TICKS:
+            try:
+                backup_tick_history(history_sheet)
+                _last_tick_backup_count = tick_counter
+                # Daily rolling snapshot at first tick after midnight
+                if dt.now(IST).hour == 0 and dt.now(IST).minute < 5:
+                    daily_rolling_backup()
+            except Exception as e:
+                print(f"⚠️ Auto-backup error: {e}")
 
     except Exception as e:
         print(f"⚠️ Error storing tick data: {e}")
@@ -2006,30 +1684,20 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
         traceback.print_exc()
 
 
-# ----------------------------------------------------------------------
-# Main option chain loop
-# ----------------------------------------------------------------------
-
 def get_nse_strike_classification(df_full, spot_ltp):
     try:
         spot = float(spot_ltp or 0)
     except Exception:
         spot = 0.0
-
     strikes = []
     try:
-        col = next((c for c in ["Strike", "Strike Price", "strike", "strprc"]
-                    if c in df_full.columns), None)
+        col = next((c for c in ["Strike", "Strike Price", "strike", "strprc"] if c in df_full.columns), None)
         if col:
-            strikes = sorted({float(x) for x in df_full[col].tolist()
-                              if x is not None and str(x).strip() != ""})
+            strikes = sorted({float(x) for x in df_full[col].tolist() if x is not None and str(x).strip() != ""})
     except Exception:
         pass
-
     if not strikes:
-        return {"atm": None, "ce_itm": set(), "ce_otm": set(),
-                "pe_itm": set(), "pe_otm": set()}
-
+        return {"atm": None, "ce_itm": set(), "ce_otm": set(), "pe_itm": set(), "pe_otm": set()}
     atm = min(strikes, key=lambda x: abs(x - spot))
     return {
         "atm": atm,
@@ -2050,8 +1718,6 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
     build_option_chain_template()
     dump_available_expiries(oc_sheet)
 
-    # Auto-fill Expiry (B1) with the nearest upcoming expiry if it's blank,
-    # and report which of the core config cells (B1-B4) still need attention.
     _auto_select_expiry_if_blank(oc_sheet)
     _report_blank_config_cells(oc_sheet)
 
@@ -2060,19 +1726,15 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
     refresh_rate = 1
     last_aggregation_time = None
     
-    # Check Tick_History status at startup
     check_tick_history_status(history_sheet)
 
     while True:
         try:
-            # Check for updated aggregation interval from Excel
             agg_interval = oc_sheet.range("B4").value
             if agg_interval and isinstance(agg_interval, (int, float)) and agg_interval > 0:
                 if int(agg_interval) != AGGREGATION_INTERVAL:
                     AGGREGATION_INTERVAL = int(agg_interval)
                     print(f"✅ Aggregation interval updated to {AGGREGATION_INTERVAL} minutes")
-                    # No title row to update anymore - interval is shown on
-                    # OptionChain!B4 and headers now sit in Candel row 1.
             
             expiry_str = oc_sheet.range("B1").value
             if not expiry_str:
@@ -2090,7 +1752,6 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
             refresh_rate = max(0.05, float(oc_sheet.range("B3").value or 0.10))
             iv_underlying_mode = str(oc_sheet.range("B7").value or "SPOT").strip().upper()
 
-            # Optional post-market window
             pm_value = str(oc_sheet.range("B5").value or "ON").strip().upper()
             POST_MARKET_ENABLED = pm_value in ("ON", "YES", "TRUE", "1")
             end_value = str(oc_sheet.range("B6").value or "23:59").strip()
@@ -2123,11 +1784,6 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                         subscribe_token(EXCHANGE, s["CE_Token"])
                 subs_lst.append(SYMBOL)
 
-            # Spot/future tokens are already subscribed over the websocket at
-            # the top of run_option_chain, so pull them from live_data (like
-            # every other field) instead of blocking on a REST round trip
-            # every single loop iteration. Only fall back to REST if the
-            # websocket hasn't delivered a tick for that token yet (cold start).
             spot_key = f"{SPOT_EXCHANGE}|{NIFTY_SPOT_TOKEN}"
             spot_ltp = convert_to_float(get_field(spot_key, "lp", 0))
             if spot_ltp == 0:
@@ -2190,32 +1846,20 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                 })
 
             df_full = pd.DataFrame(rows).sort_values(by="strike").reset_index(drop=True)
-
-            # Find the index of the strike closest to spot
             df_full["strike_diff"] = abs(df_full["strike"] - spot_ltp)
             atm_idx = df_full["strike_diff"].idxmin()
             atm_strike = df_full.loc[atm_idx, "strike"]
 
-            # Get ATM data
             atm_ce_price = df_full.loc[atm_idx, "CE_lp"]
             atm_pe_price = df_full.loc[atm_idx, "PE_lp"]
 
-            # IMPORTANT: Refresh IV calculator on EVERY cycle.
-            # Spot, future, ATM prices and time change continuously. Keeping
-            # the calculator only for the whole expiry makes IV stale.
             print("🔄 Updating IV calculator with current market snapshot...")
-            if not init_iv_calculator(
-                spot_ltp, future_ltp, atm_strike,
-                atm_ce_price, atm_pe_price, expiry_input,
-                underlying_mode=iv_underlying_mode
-            ):
+            if not init_iv_calculator(spot_ltp, future_ltp, atm_strike, atm_ce_price, atm_pe_price, expiry_input, underlying_mode=iv_underlying_mode):
                 print("⚠️ IV calculator update failed; IV will be 0 for this refresh.")
             pre_expiry = expiry_input
 
-            # Get first OTM Call and Put strikes from FULL dataframe
             otm_call_strike, otm_put_strike = get_first_otm_strikes(df_full, spot_ltp, atm_strike, STRIKE_STEP)
 
-            # Trim to N strikes each side of ATM for display
             lo = max(0, atm_idx - no_of_strike)
             hi = min(len(df_full), atm_idx + no_of_strike + 1)
             df_display = df_full.iloc[lo:hi].reset_index(drop=True)
@@ -2233,7 +1877,6 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
             call_buy_sell_diff = total_call_buy - total_call_sell
             put_buy_sell_diff = total_put_buy - total_put_sell
             
-            # Calculate IV for each strike in display
             call_iv_list = []
             put_iv_list = []
             
@@ -2275,18 +1918,8 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                 "Put Bid": df_display["PE_bp1"],
                 "Put Ask": df_display["PE_sp1"],
                 "Put Bid-Ask Diff": df_display["PE_sp1"] - df_display["PE_bp1"],
-                "PCR OI": np.where(
-                    pd.to_numeric(df_display["CE_oi"], errors="coerce").fillna(0) != 0,
-                    pd.to_numeric(df_display["PE_oi"], errors="coerce").fillna(0) /
-                    pd.to_numeric(df_display["CE_oi"], errors="coerce").fillna(0),
-                    0.0
-                ),
-                "PCR Change OI": np.where(
-                    pd.to_numeric(df_display["CE_coi"], errors="coerce").fillna(0) != 0,
-                    pd.to_numeric(df_display["PE_coi"], errors="coerce").fillna(0) /
-                    pd.to_numeric(df_display["CE_coi"], errors="coerce").fillna(0),
-                    0.0
-                ),
+                "PCR OI": np.where(pd.to_numeric(df_display["CE_oi"], errors="coerce").fillna(0) != 0, pd.to_numeric(df_display["PE_oi"], errors="coerce").fillna(0) / pd.to_numeric(df_display["CE_oi"], errors="coerce").fillna(0), 0.0),
+                "PCR Change OI": np.where(pd.to_numeric(df_display["CE_coi"], errors="coerce").fillna(0) != 0, pd.to_numeric(df_display["PE_coi"], errors="coerce").fillna(0) / pd.to_numeric(df_display["CE_coi"], errors="coerce").fillna(0), 0.0),
             })
 
             if pre_expiry != expiry_input or pre_no_of_strike != no_of_strike:
@@ -2297,30 +1930,27 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                 pre_expiry, pre_no_of_strike = expiry_input, no_of_strike
 
             oc_sheet.range("A10").options(index=False, header=True).value = df_final
-
-            # atm_idx is the position in df_full; lo is where df_display was
-            # sliced from - so this is the exact displayed row without any
-            # Excel read-back.
             apply_atm_highlight(oc_sheet, 11 + (atm_idx - lo))
             
-            # Store tick data using FULL dataframe with IV calculation
             store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strike, otm_put_strike, expiry_input, future_ltp, atm_ce_price, atm_pe_price)
             
-            # ============================================================
-            # AGGREGATE CANDLES - APPEND new candles
-            # ============================================================
             current_time = dt.now()
-
-            # ULTRA-FAST CANDLE UPDATE:
-            # Update the current 1-minute candle immediately after each
-            # NEW market snapshot. Do not wait another 60 seconds.
             global last_candle_tick_counter
             if tick_counter >= 1 and tick_counter != last_candle_tick_counter:
-                aggregate_candles(
-                    history_sheet,
-                    candle_sheet,
-                    AGGREGATION_INTERVAL
-                )
+                aggregate_candles(history_sheet, candle_sheet, AGGREGATION_INTERVAL)
+                
+                # ============================================================
+                # CANDLE BACKUP - only when a NEW candle row is added
+                # ============================================================
+                try:
+                    new_last_row = get_last_actual_row(candle_sheet, "A", 1)
+                    global _last_candle_backup_row
+                    if new_last_row > _last_candle_backup_row:
+                        backup_candle_history(candle_sheet)
+                        _last_candle_backup_row = new_last_row
+                except Exception as e:
+                    print(f"⚠️ Candle backup error: {e}")
+                
                 last_candle_tick_counter = tick_counter
             
             oc_sheet.range("C1").value = (
@@ -2341,7 +1971,6 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
         time.sleep(refresh_rate)
 
 
-# ----------------------------------------------------------------------
 if __name__ == "__main__":
     print(f"Starting {SYMBOL} option chain tool...")
     print(f"Excel file: {WORKBOOK_NAME}")
@@ -2359,9 +1988,6 @@ if __name__ == "__main__":
 
     load_instruments()
 
-    # Start WebSocket. If the saved token cannot open it, use the saved
-    # AUTH CODE first. Only if getAccessToken(AUTH_CODE) returns None do
-    # we generate a new browser OAuth code.
     def start_ws_and_wait(seconds=15):
         global feed_opened
         feed_opened = False
@@ -2387,9 +2013,6 @@ if __name__ == "__main__":
                 print("❌ WebSocket still did not open after saved AUTH CODE.")
                 print("   Browser login is NOT started unless AUTH CODE returned None.")
         elif login_data.get("auth_code"):
-            # IMPORTANT: getAccessToken() returned None.  Do NOT call shoonya_login()
-            # here because shoonya_login() is intentionally TOKEN-FIRST and would
-            # simply reuse the same rejected token again.
             print("🚨 SAVED AUTH CODE WAS REJECTED (getAccessToken returned None).")
             print("🔄 Generating ONE NEW OAuth AUTH CODE now...")
             print("--------------------------------------------------")
@@ -2400,17 +2023,14 @@ if __name__ == "__main__":
 
                 new_api = _make_api()
                 auth_code_new = get_auth_code_via_selenium(
-                    login_data["client_id"],
-                    login_data["user_id"],
-                    login_data["password"],
-                    login_data["totp_secret"],
+                    login_data["client_id"], login_data["user_id"],
+                    login_data["password"], login_data["totp_secret"],
                 )
                 if not auth_code_new:
                     print("❌ Browser did not return a new AUTH CODE.")
                     sys.exit(1)
 
                 print(f"   Auth code obtained: {auth_code_new[:20]}...")
-                # Exchange the NEW code on the NEW API object.
                 login_data = get_all_login_data(login_sheet)
                 if not _login_from_auth_code(login_sheet, login_data, auth_code_new):
                     print("❌ New AUTH CODE could not produce an access token.")
@@ -2426,7 +2046,6 @@ if __name__ == "__main__":
                 traceback.print_exc()
                 sys.exit(1)
         else:
-            # No saved AUTH CODE: generate one fresh code immediately.
             print("⚠️ No saved AUTH CODE available.")
             print("🔄 Generating ONE NEW OAuth AUTH CODE now...")
             login_data = get_all_login_data(login_sheet)
@@ -2454,4 +2073,47 @@ if __name__ == "__main__":
         print("⚠️ WebSocket is not open yet; continuing without creating another sheet/login.")
     print("-" * 50)
 
-    run_option_chain(wb, oc_sheet, history_sheet, candle_sheet)
+    # ============================================================
+    # CRASH-PROOF RUNNER - reopens Excel + restores data if it dies
+    # ============================================================
+    def run_with_recovery():
+        global wb, oc_sheet, history_sheet, candle_sheet
+        while True:
+            try:
+                run_option_chain(wb, oc_sheet, history_sheet, candle_sheet)
+                break  # normal exit
+            except KeyboardInterrupt:
+                print("\n🛑 Stopped by user. Final backup...")
+                try:
+                    backup_tick_history(history_sheet)
+                    backup_candle_history(candle_sheet)
+                except Exception:
+                    pass
+                break
+            except Exception as e:
+                print(f"\n💥 MAIN LOOP CRASHED: {e}")
+                import traceback
+                traceback.print_exc()
+                # Force an emergency backup using whatever is still in Excel
+                try:
+                    backup_tick_history(history_sheet)
+                    backup_candle_history(candle_sheet)
+                    print("💾 Emergency backup saved before recovery.")
+                except Exception as be:
+                    print(f"❌ Emergency backup failed: {be}")
+                # Try to reopen Excel from file (handles Excel crash/close)
+                try:
+                    xw.App().kill()  # kill any zombie Excel
+                except Exception:
+                    pass
+                time.sleep(5)
+                try:
+                    wb, login_sheet, oc_sheet, history_sheet, candle_sheet = get_or_create_workbook()
+                    print("✅ Excel reopened + data restored. Resuming in 10s...")
+                    time.sleep(10)
+                except Exception as re_err:
+                    print(f"❌ Excel reopen failed: {re_err}")
+                    print("   Backups are safe on disk. Fix Excel and rerun.")
+                    break
+
+    run_with_recovery()
