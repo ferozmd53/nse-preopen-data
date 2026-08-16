@@ -1,4 +1,4 @@
-
+# CANDLE COLUMN ORDER: Call Change OI is beside Call OI; Put Change OI is beside Put OI.
 import os
 import sys
 import time
@@ -8,9 +8,15 @@ import warnings
 from datetime import timezone, timedelta
 
 warnings.filterwarnings("ignore")
+try:
+    import requests
+    response = requests.get('https://api.ipify.org', timeout=5)
+    print(f"\nYour current IP address is: {response.text}")
+except:
+    pass
 # ---- dependency bootstrap ----
 for pkg in ["pandas", "pyotp", "xlwings", "requests", "numpy",
-            "selenium", "webdriver_manager", "openpyxl"]:
+            "selenium", "webdriver_manager", "openpyxl", "scipy"]:
     try:
         __import__(pkg)
     except ImportError:
@@ -21,6 +27,7 @@ import numpy as np
 import pyotp
 import xlwings as xw
 import requests
+from scipy.optimize import brentq
 
 # Fix NumPy 2.0 compatibility
 if not hasattr(np, 'PINF'):
@@ -48,7 +55,8 @@ from NorenRestApiPy.NorenApi import NorenApi
 # ============================================================
 # CONFIGURATION - Hardcoded symbol
 # ============================================================
-WORKBOOK_NAME = "shoonya_OptionChain.xlsx"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WORKBOOK_NAME = os.path.join(BASE_DIR, "shoonya_OptionChain.xlsx")
 SYMBOL = "NIFTY"  # Hardcoded symbol
 EXCHANGE = "NFO"
 SPOT_EXCHANGE = "NSE"
@@ -61,7 +69,7 @@ AGGREGATION_INTERVAL = 1  # Default candle interval in minutes
 # Timezone setup
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_START = 9 * 60 + 15  # 9:15 AM in minutes
-MARKET_END = 15 * 60 + 30   # 3:30 PM in minutes
+MARKET_END = 23 * 60 + 59   # 3:30 PM in minutes
 
 live_data = {}
 subs_lst = []
@@ -84,36 +92,17 @@ last_traded_time = ""
 # Time columns are intentionally excluded so a repeated snapshot is not written again.
 last_tick_signature = None
 
-# HIGH-SPEED MODE STATE
-# WebSocket callback increments this only when actual market-data fields change.
-market_data_version = 0
-last_processed_market_data_version = -1
-last_optionchain_signature = None
-last_atm_highlight_strike = None
-last_saved_market_data_version = -1
-last_excel_save_time = 0.0
-last_history_tick_counter_for_candle = -1
-
-# TRUE HIGH-SPEED BUFFERING
-# WebSocket ticks are accepted immediately in memory. Excel receives them
-# in small batches instead of one COM write per tick.
-pending_history_rows = []
-history_next_row = None
-last_history_flush_time = 0.0
-HISTORY_FLUSH_INTERVAL = 0.25
-CANDLE_UPDATE_INTERVAL = 0.50
-last_candle_update_mono = 0.0
-last_config_read_mono = 0.0
-CONFIG_READ_INTERVAL = 0.50
-
 # Store raw tick data for aggregation
 raw_ticks = []
 last_aggregation_time = None
+last_candle_tick_counter = 0
 
 # Global variables for NSE IV calculation
 current_expiry_date = None
 current_spot = 0.0
 current_future = 0.0
+current_iv_underlying = 0.0     # the price actually fed into Black-Scholes
+current_iv_underlying_mode = "SPOT"  # "SPOT" or "FUTURE", read from OptionChain!B7
 current_atm_strike = 0.0
 current_atm_call_price = 0.0
 current_atm_put_price = 0.0
@@ -158,58 +147,75 @@ def epoch_to_ist(epoch_time):
 
 
 def format_timestamp(ts_value):
-    """Format timestamp to HH:MM:SS format"""
+    """Return HH:MM:SS safely. Never return an Excel serial/date."""
+    if ts_value is None or ts_value == "":
+        return ""
     try:
-        if ts_value is None or ts_value == "":
+        if isinstance(ts_value, (int, float, np.integer, np.floating)):
+            x = float(ts_value)
+            # Unix epoch seconds only
+            if x > 100000000:
+                return epoch_to_ist(x).strftime("%H:%M:%S")
+            # Excel serial time/day: convert only if clearly a fraction of a day
+            if 0 <= x < 1:
+                total = int(round(x * 86400))
+                h = (total // 3600) % 24
+                m = (total % 3600) // 60
+                s = total % 60
+                return f"{h:02d}:{m:02d}:{s:02d}"
             return ""
-        
-        if isinstance(ts_value, (int, float)):
-            ist_dt = epoch_to_ist(ts_value)
-            if ist_dt:
-                return ist_dt.strftime('%H:%M:%S')
-        
-        if isinstance(ts_value, str):
-            try:
-                epoch_val = float(ts_value)
-                ist_dt = epoch_to_ist(epoch_val)
-                if ist_dt:
-                    return ist_dt.strftime('%H:%M:%S')
-            except:
-                pass
-            
-            if ts_value.startswith('NIFTY'):
-                return ""
-            
-            try:
-                if ':' in ts_value and '.' in ts_value:
-                    parts = ts_value.split(':')
-                    if len(parts) == 3:
-                        return f"{int(parts[0]):02d}:{int(parts[1]):02d}:{int(parts[2].split('.')[0]):02d}"
-                    elif len(parts) == 2:
-                        minutes = int(parts[0])
-                        seconds = int(parts[1].split('.')[0])
-                        hours = minutes // 60
-                        minutes = minutes % 60
-                        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-                elif ':' in ts_value:
-                    parts = ts_value.split(':')
-                    if len(parts) == 3:
-                        return f"{int(parts[0]):02d}:{int(parts[1]):02d}:{int(parts[2]):02d}"
-                    elif len(parts) == 2:
-                        minutes = int(parts[0])
-                        seconds = int(parts[1])
-                        hours = minutes // 60
-                        minutes = minutes % 60
-                        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-                return ts_value
-            except:
-                pass
-        
-        return ""
-    except Exception as e:
-        print(f"⚠️ Error formatting timestamp {ts_value}: {e}")
-        return ""
+        s = str(ts_value).strip()
+        if not s or s.upper() in ("NIFTY 50", "NIFTY50"):
+            return ""
+        try:
+            x = float(s)
+            if x > 100000000:
+                return epoch_to_ist(x).strftime("%H:%M:%S")
+            if 0 <= x < 1:
+                total = int(round(x * 86400))
+                return f"{(total//3600)%24:02d}:{(total%3600)//60:02d}:{total%60:02d}"
+        except Exception:
+            pass
+        # Handle HH:MM, HH:MM:SS, and minute:second formats.
+        parts = s.split(":")
+        if len(parts) == 3:
+            h = int(float(parts[0])); m = int(float(parts[1])); sec = int(float(parts[2]))
+            return f"{h%24:02d}:{m%60:02d}:{sec%60:02d}"
+        if len(parts) == 2:
+            a = int(float(parts[0])); b = int(float(parts[1]))
+            if a < 24:
+                return f"{a:02d}:{b%60:02d}:00"
+            return f"{a//60:02d}:{a%60:02d}:{b%60:02d}"
+    except Exception:
+        pass
+    return ""
 
+def format_feed_datetime(ts_value):
+    """Return a real text datetime, never an Excel 1900 date."""
+    if ts_value is None or ts_value == "":
+        return ""
+    try:
+        if isinstance(ts_value, (int, float, np.integer, np.floating)):
+            x = float(ts_value)
+            if x > 100000000:
+                return epoch_to_ist(x).strftime("%Y-%m-%d %H:%M:%S")
+            t = format_timestamp(x)
+            return f"{dt.now(IST).strftime('%Y-%m-%d')} {t}" if t else ""
+        s = str(ts_value).strip()
+        if not s or s.upper() in ("NIFTY 50", "NIFTY50"):
+            return ""
+        try:
+            x = float(s)
+            if x > 100000000:
+                return epoch_to_ist(x).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        t = format_timestamp(s)
+        if t:
+            return f"{dt.now(IST).strftime('%Y-%m-%d')} {t}"
+        return s
+    except Exception:
+        return ""
 
 def parse_date(date_input):
     if date_input is None:
@@ -253,6 +259,31 @@ def get_field(token_key, field, default=0):
         return value
     except Exception:
         return default
+
+
+def _market_session_date(now_ist):
+    """Return the trading-session date the CURRENT market data actually
+    belongs to.
+
+    Shoonya's LTP/quote feed freezes at the last traded price whenever the
+    market is shut (weekends, before 9:15 AM), so a live option's price on a
+    Sunday is really Friday's close - it still has Friday's time value, not
+    Sunday's. Feeding wall-clock 'now' into the DTE calc on a non-trading
+    day/hour silently shortens T and inflates every IV. This walks the
+    valuation date back to the session the live prices actually reflect.
+    """
+    d = now_ist.date()
+    minutes_now = now_ist.hour * 60 + now_ist.minute
+
+    # Weekday before the market opens: still quoting yesterday's close.
+    if now_ist.weekday() < 5 and minutes_now < MARKET_START:
+        d -= timedelta(days=1)
+
+    # Roll back over weekends (Sat=5, Sun=6) to the prior trading day.
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+
+    return d
 
 
 def _nse_calendar_dte(expiry_date, valuation_dt=None):
@@ -302,45 +333,46 @@ def _bs_put_price(spot, strike, rate, T, sigma):
     return strike * math.exp(-rate * T) * _normal_cdf(-d2) - spot * _normal_cdf(-d1)
 
 
-def _solve_iv(option_price, pricing_function, lower_bound, upper_bound, max_iter=120):
-    """Solve IV by bisection without requiring scipy."""
+def _solve_iv(option_price, pricing_function, lower_bound, upper_bound, intrinsic=0.0):
+    """Solve IV via scipy's brentq (validated against NSE's published IV in
+    IV_EXACT_MATCH.py - Brent's method root-find, same convention as NSE's
+    option-chain page: 10% rate, calendar-day T, spot/future underlying).
+    """
     if option_price <= 0:
         return 0.0
 
-    lo = 1e-8
-    hi = 5.0  # 500% annualized volatility is a safe numerical ceiling.
-    p_lo = pricing_function(lo)
-    p_hi = pricing_function(hi)
+    # An option trading at/below intrinsic value has no time value to solve
+    # a volatility from - mirrors IV_EXACT_MATCH.py's intrinsic check.
+    if option_price <= intrinsic:
+        return 0.0
 
     # Market price must be inside the model's no-arbitrage range.
     if option_price < lower_bound - 1e-7 or option_price > upper_bound + 1e-7:
         return 0.0
 
-    # If the option is essentially at its lower bound, IV is not stable.
-    if abs(option_price - p_lo) < 1e-9:
+    objective = lambda sigma: pricing_function(sigma) - option_price
+    try:
+        iv = brentq(objective, 1e-4, 5.0)
+    except ValueError:
         return 0.0
 
-    if p_lo > option_price or p_hi < option_price:
-        return 0.0
-
-    for _ in range(max_iter):
-        mid = (lo + hi) / 2.0
-        p_mid = pricing_function(mid)
-        if abs(p_mid - option_price) < 1e-9:
-            return mid * 100.0
-        if p_mid < option_price:
-            lo = mid
-        else:
-            hi = mid
-
-    return ((lo + hi) / 2.0) * 100.0
+    return iv * 100.0
 
 
-def init_iv_calculator(spot_ltp, future_ltp, atm_strike, atm_call_price, atm_put_price, expiry_date):
-    """Refresh the NSE IV engine with the current market snapshot."""
+def init_iv_calculator(spot_ltp, future_ltp, atm_strike, atm_call_price, atm_put_price,
+                        expiry_date, underlying_mode="SPOT"):
+    """Refresh the NSE IV engine with the current market snapshot.
+
+    underlying_mode selects which price is fed into Black-Scholes as S:
+      "SPOT"   -> raw index LTP (the old, only, behaviour)
+      "FUTURE" -> the NIFTY future LTP
+    Controlled live from OptionChain!B7 so you can A/B test against the
+    NSE page without editing code - see run_option_chain().
+    """
     global current_expiry_date, current_spot, current_future
     global current_atm_strike, current_atm_call_price, current_atm_put_price
     global current_iv_dte_days, current_iv_T, current_iv_timestamp
+    global current_iv_underlying, current_iv_underlying_mode
 
     current_spot = convert_to_float(spot_ltp)
     current_future = convert_to_float(future_ltp)
@@ -350,14 +382,22 @@ def init_iv_calculator(spot_ltp, future_ltp, atm_strike, atm_call_price, atm_put
     current_expiry_date = expiry_date
     current_iv_timestamp = dt.now(IST).replace(tzinfo=None)
 
-    current_iv_dte_days = _nse_calendar_dte(expiry_date, current_iv_timestamp)
+    current_iv_underlying_mode = "FUTURE" if str(underlying_mode).strip().upper().startswith("F") else "SPOT"
+    current_iv_underlying = current_future if current_iv_underlying_mode == "FUTURE" and current_future > 0 else current_spot
+
+    # DTE must be dated to the trading session the live prices belong to,
+    # not to wall-clock 'now' - see _market_session_date().
+    session_date = _market_session_date(current_iv_timestamp)
+    dte_valuation_dt = dt.combine(session_date, current_iv_timestamp.time())
+    current_iv_dte_days = _nse_calendar_dte(expiry_date, dte_valuation_dt)
     current_iv_T = current_iv_dte_days / NSE_IV_DAYS_PER_YEAR
 
-    if current_spot <= 0 or current_iv_dte_days <= 0:
+    if current_iv_underlying <= 0 or current_iv_dte_days <= 0:
         return False
 
     print(
-        f"🔄 NSE IV engine: Spot={current_spot:.2f} "
+        f"🔄 NSE IV engine: Underlying({current_iv_underlying_mode})={current_iv_underlying:.2f} "
+        f"[Spot={current_spot:.2f} Fut={current_future:.2f}] "
         f"Expiry={expiry_date} DTE={current_iv_dte_days} "
         f"T={current_iv_T:.8f} r={NSE_IV_RATE:.2%}"
     )
@@ -365,13 +405,18 @@ def init_iv_calculator(spot_ltp, future_ltp, atm_strike, atm_call_price, atm_put
 
 
 def calculate_iv_for_strike(strike_price, call_price, put_price):
-    """Calculate independent NSE-style CE IV and PE IV for one strike."""
+    """Calculate independent NSE-style CE IV and PE IV for one strike.
+
+    Prices off current_iv_underlying (set by init_iv_calculator from the
+    OptionChain!B7 SPOT/FUTURE toggle), not always raw spot.
+    """
     strike = convert_to_float(strike_price)
     call = convert_to_float(call_price)
     put = convert_to_float(put_price)
+    underlying = current_iv_underlying
 
     if (
-        current_spot <= 0 or strike <= 0 or current_iv_T <= 0
+        underlying <= 0 or strike <= 0 or current_iv_T <= 0
         or (call <= 0 and put <= 0)
     ):
         return 0.0, 0.0
@@ -379,10 +424,15 @@ def calculate_iv_for_strike(strike_price, call_price, put_price):
     discount_factor = math.exp(-NSE_IV_RATE * current_iv_T)
 
     # European Black-Scholes no-arbitrage bounds using NSE's 10% rate.
-    call_lower = max(current_spot - strike * discount_factor, 0.0)
-    call_upper = current_spot
-    put_lower = max(strike * discount_factor - current_spot, 0.0)
+    call_lower = max(underlying - strike * discount_factor, 0.0)
+    call_upper = underlying
+    put_lower = max(strike * discount_factor - underlying, 0.0)
     put_upper = strike * discount_factor
+
+    # Simple (undiscounted) intrinsic value - same check IV_EXACT_MATCH.py
+    # uses to reject option prices with no time value before solving.
+    call_intrinsic = max(underlying - strike, 0.0)
+    put_intrinsic = max(strike - underlying, 0.0)
 
     call_iv = 0.0
     put_iv = 0.0
@@ -391,20 +441,22 @@ def calculate_iv_for_strike(strike_price, call_price, put_price):
         call_iv = _solve_iv(
             call,
             lambda sigma: _bs_call_price(
-                current_spot, strike, NSE_IV_RATE, current_iv_T, sigma
+                underlying, strike, NSE_IV_RATE, current_iv_T, sigma
             ),
             call_lower,
             call_upper,
+            call_intrinsic,
         )
 
     if put > 0:
         put_iv = _solve_iv(
             put,
             lambda sigma: _bs_put_price(
-                current_spot, strike, NSE_IV_RATE, current_iv_T, sigma
+                underlying, strike, NSE_IV_RATE, current_iv_T, sigma
             ),
             put_lower,
             put_upper,
+            put_intrinsic,
         )
 
     return round(call_iv, 2), round(put_iv, 2)
@@ -412,173 +464,6 @@ def calculate_iv_for_strike(strike_price, call_price, put_price):
 
 # ----------------------------------------------------------------------
 # Workbook setup
-
-# ----------------------------------------------------------------------
-# PUBLIC IP CHECK - Login sheet B11/B12/D11/D12
-# B11 = today's approved IP (auto-updated on a new calendar day)
-# D11 = date for B11
-# B12 = current detected IP
-# D12 = current IP check timestamp
-# Same-day IP mismatch stops the script. On a new day B11 is auto-refreshed.
-# ----------------------------------------------------------------------
-def get_current_public_ip():
-    """Get the machine's current public IPv4 address."""
-    providers = [
-        "https://api.ipify.org",
-        "https://ifconfig.me/ip",
-        "https://checkip.amazonaws.com",
-    ]
-    last_error = None
-    for url in providers:
-        try:
-            r = requests.get(url, timeout=5)
-            ip = r.text.strip()
-            if ip and len(ip) <= 64 and "." in ip:
-                return ip
-        except Exception as e:
-            last_error = e
-    print(f"❌ Could not determine current public IP: {last_error}")
-    return ""
-
-
-def check_login_ip(login_sheet):
-    """Automatic daily IP approval/check.
-
-    Login sheet layout:
-      B11 = approved/previous IP for the current day
-      D11 = date on which B11 was approved
-      B12 = automatically detected current public IP
-      D12 = date/time of current IP check
-
-    Rules:
-      1. Every run automatically detects the current public IP.
-      2. If B11 is blank, save current IP into B11 and today's date into D11.
-      3. If the date stored in D11 is NOT today, automatically replace B11
-         with today's current IP and update D11. No manual paste is needed.
-      4. If D11 is today, B11 is treated as today's approved IP.
-         If B11 != B12, STOP the script because the IP changed during today.
-      5. B12/D12 are always refreshed so the current IP is visible in Excel.
-    """
-    try:
-        login_sheet.range("A11").value = "PREVIOUS / TODAY APPROVED IP"
-        login_sheet.range("A12").value = "NEW / CURRENT IP"
-        login_sheet.range("C11").value = "IP APPROVAL DATE"
-        login_sheet.range("C12").value = "CURRENT IP CHECK TIME"
-        login_sheet.range("D11").value = ""
-        login_sheet.range("D12").value = ""
-
-        previous_ip = str(login_sheet.range("B11").value or "").strip()
-        saved_date_raw = login_sheet.range("D11").value
-        current_ip = get_current_public_ip()
-        now = dt.now()
-        today = now.date()
-
-        if not current_ip:
-            login_sheet.range("D12").value = "IP CHECK FAILED"
-            login_sheet.book.save()
-            print("❌ Current public IP could not be obtained.")
-            print("❌ Script stopped before login/WebSocket.")
-            return False
-
-        # Always show the current IP in B12.
-        login_sheet.range("B12").value = current_ip
-        login_sheet.range("D12").value = now.strftime("%Y-%m-%d %H:%M:%S")
-
-        # Parse the date associated with B11.
-        saved_date = None
-        if saved_date_raw not in (None, ""):
-            try:
-                if isinstance(saved_date_raw, dt):
-                    saved_date = saved_date_raw.date()
-                elif hasattr(saved_date_raw, "date") and not isinstance(saved_date_raw, str):
-                    saved_date = saved_date_raw.date()
-                else:
-                    text = str(saved_date_raw).strip()
-                    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y",
-                                "%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S"):
-                        try:
-                            saved_date = dt.strptime(text, fmt).date()
-                            break
-                        except ValueError:
-                            pass
-                    if saved_date is None:
-                        try:
-                            saved_date = pd.to_datetime(text, dayfirst=False).date()
-                        except Exception:
-                            saved_date = None
-            except Exception:
-                saved_date = None
-
-        print("--------------------------------------------------")
-        print("🌐 SHOONYA AUTOMATIC DAILY IP CHECK")
-        print(f"   Previous IP in Login!B11 : {previous_ip or '[BLANK]'}")
-        print(f"   Previous IP date in D11  : {saved_date or '[BLANK]'}")
-        print(f"   Current IP in Login!B12  : {current_ip}")
-        print(f"   Today                     : {today}")
-
-        # ------------------------------------------------------------
-        # FIRST RUN OR NEW DAY:
-        # Automatically approve today's current IP.
-        # ------------------------------------------------------------
-        if not previous_ip or saved_date != today:
-            reason = "B11 is blank" if not previous_ip else (
-                f"B11 date is {saved_date}, today is {today}"
-            )
-
-            login_sheet.range("B11").value = current_ip
-            login_sheet.range("D11").value = today.strftime("%Y-%m-%d")
-            login_sheet.range("C11").value = "TODAY IP AUTO-APPROVED"
-            login_sheet.range("C12").value = "CURRENT IP SAVED AUTOMATICALLY"
-            login_sheet.book.save()
-
-            print(f"🔄 Daily IP reset required: {reason}")
-            print(f"✅ Automatically saved today's IP to Login!B11: {current_ip}")
-            print(f"✅ Automatically saved today's date to Login!D11: {today}")
-            print("✅ No manual IP paste required.")
-            print("--------------------------------------------------")
-            return True
-
-        # ------------------------------------------------------------
-        # SAME DAY:
-        # Strict comparison. If today's IP changed, stop.
-        # ------------------------------------------------------------
-        if previous_ip != current_ip:
-            login_sheet.range("C11").value = "IP MISMATCH - SCRIPT STOPPED"
-            login_sheet.range("C12").value = "TODAY'S IP CHANGED"
-            login_sheet.book.save()
-
-            print("❌❌❌ IP ADDRESS MISMATCH ❌❌❌")
-            print(f"   Today's approved IP (B11): {previous_ip}")
-            print(f"   Current IP          (B12): {current_ip}")
-            print("   Date of approval    (D11):", saved_date)
-            print("")
-            print("🚫 SCRIPT STOPPED.")
-            print("👉 The IP changed during the same day.")
-            print("👉 Set/whitelist the CURRENT IP in the Shoonya Trading Platform.")
-            print(f"👉 Current IP to set in Shoonya: {current_ip}")
-            print("👉 On a new calendar day, B11 will automatically update to the new IP.")
-            print("--------------------------------------------------")
-            return False
-
-        login_sheet.range("C11").value = "IP MATCHED - OK"
-        login_sheet.range("C12").value = "CURRENT IP MATCHES TODAY'S APPROVED IP"
-        login_sheet.book.save()
-
-        print("✅ IP MATCHED.")
-        print("   Today's approved IP and current IP are identical.")
-        print("   No manual IP update is required.")
-        print("--------------------------------------------------")
-        return True
-
-    except Exception as e:
-        print(f"❌ IP check error: {e}")
-        try:
-            login_sheet.range("C11").value = f"IP CHECK ERROR: {str(e)[:100]}"
-            login_sheet.book.save()
-        except Exception:
-            pass
-        return False
-
 
 # ----------------------------------------------------------------------
 def get_or_create_workbook():
@@ -610,8 +495,14 @@ def get_or_create_workbook():
         oc_sheet.range("A3").value = "RefreshRate(sec) =>"
         oc_sheet.range("A4").value = "Aggregation Interval (min) =>"
         oc_sheet.range("B2").value = NUMBER_OF_STRIKES
-        oc_sheet.range("B3").value = 3
+        oc_sheet.range("B3").value = 1
         oc_sheet.range("B4").value = AGGREGATION_INTERVAL
+        oc_sheet.range("A5").value = "Post-Market ON/OFF =>"
+        oc_sheet.range("B5").value = "ON"
+        oc_sheet.range("A6").value = "Run Until (HH:MM) =>"
+        oc_sheet.range("B6").value = "18:00"
+        oc_sheet.range("A7").value = "IV Underlying (SPOT/FUTURE) =>"
+        oc_sheet.range("B7").value = "SPOT"
         oc_sheet.range("C1").value = "Available expiries -->"
         oc_sheet.range("G1").value = f"Symbol: {SYMBOL}"
         oc_sheet.range("H1").value = f"Token: {NIFTY_SPOT_TOKEN}"
@@ -621,29 +512,56 @@ def get_or_create_workbook():
         oc_sheet.range("G1").value = f"Symbol: {SYMBOL}"
         oc_sheet.range("H1").value = f"Token: {NIFTY_SPOT_TOKEN}"
         oc_sheet.range("B2").value = NUMBER_OF_STRIKES
+        if not oc_sheet.range("A5").value:
+            oc_sheet.range("A5").value = "Post-Market ON/OFF =>"
+        if not oc_sheet.range("B5").value:
+            oc_sheet.range("B5").value = "ON"
+        if not oc_sheet.range("A6").value:
+            oc_sheet.range("A6").value = "Run Until (HH:MM) =>"
+        if not oc_sheet.range("B6").value:
+            oc_sheet.range("B6").value = "18:00"
+        if not oc_sheet.range("A7").value:
+            oc_sheet.range("A7").value = "IV Underlying (SPOT/FUTURE) =>"
+        if not oc_sheet.range("B7").value:
+            oc_sheet.range("B7").value = "SPOT"
         # Read aggregation interval from Excel
         agg_interval = oc_sheet.range("B4").value
         if agg_interval and isinstance(agg_interval, (int, float)) and agg_interval > 0:
             AGGREGATION_INTERVAL = int(agg_interval)
             print(f"✅ Aggregation interval set to {AGGREGATION_INTERVAL} minutes")
 
+    # CANONICAL Tick_History layout: exactly 31 columns A:AE.
+    # Keep this list defined even when the sheet already exists.
+    headers = [
+        "Feed Time", "Request Time", "Last Traded Time",
+        "Spot", "ATM Strike", "OTM Call Strike",
+        "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI",
+        "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
+        "Call Bid", "Call Ask", "Call Bid-Ask Diff",
+        "OTM Put Strike", "Put LTP", "Put Volume", "Put IV", "Put OI", "Put Change OI",
+        "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
+        "Put Bid", "Put Ask", "Put Bid-Ask Diff",
+        "PCR OI", "PCR Change OI"
+    ]
+
+    # Canonical Tick_History headers MUST always be defined before any refresh.
+    # This fixes: "cannot access local variable headers" on existing workbooks.
+    headers = [
+        "Feed Time", "Request Time", "Last Traded Time",
+        "Spot", "ATM Strike", "OTM Call Strike",
+        "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI",
+        "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
+        "Call Bid", "Call Ask", "Call Bid-Ask Diff",
+        "OTM Put Strike", "Put LTP", "Put Volume", "Put IV", "Put OI", "Put Change OI",
+        "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
+        "Put Bid", "Put Ask", "Put Bid-Ask Diff", "PCR OI", "PCR Change OI"
+    ]
+
     history_sheet_name = "Tick_History"
     if history_sheet_name.lower() not in sheet_names:
         history_sheet = wb.sheets.add(history_sheet_name)
-        # Create headers for new sheet with IV
-        headers = [
-            "Feed Time", "Request Time", "Last Traded Time",
-            "Spot", "ATM Strike",
-            "OTM Call Strike", "Call IV", "Call OI", "Call Change OI",
-            "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
-            "Call Bid", "Call Ask", "Call Bid-Ask Diff",
-            "OTM Put Strike", "Put IV", "Put OI", "Put Change OI",
-            "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
-            "Put Bid", "Put Ask", "Put Bid-Ask Diff",
-            "PCR OI", "PCR Change OI"
-        ]
-        history_sheet.range("A1:AA1").value = headers
-        history_sheet.range("B:B").number_format = "yyyy-mm-dd hh:mm:ss"
+        history_sheet.range("A1:AE1").value = headers
+        history_sheet.range("A:C").number_format = "@"
         tick_counter = 0
     else:
         history_sheet = wb.sheets[history_sheet_name]
@@ -652,27 +570,16 @@ def get_or_create_workbook():
             header_check = history_sheet.range("A1").value
             if header_check is None or header_check == "" or header_check != "Feed Time":
                 print("📝 Creating missing headers in Tick_History...")
-                headers = [
-                    "Feed Time", "Request Time", "Last Traded Time",
-                    "Spot", "ATM Strike",
-                    "OTM Call Strike", "Call IV", "Call OI", "Call Change OI",
-                    "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
-                    "Call Bid", "Call Ask", "Call Bid-Ask Diff",
-                    "OTM Put Strike", "Put IV", "Put OI", "Put Change OI",
-                    "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
-                    "Put Bid", "Put Ask", "Put Bid-Ask Diff",
-                    "PCR OI", "PCR Change OI"
-                ]
-                history_sheet.range("A1:AA1").value = headers
-                history_sheet.range("B:B").number_format = "yyyy-mm-dd hh:mm:ss"
+                history_sheet.range("A1:AE1").value = headers
+                history_sheet.range("A:C").number_format = "@"
         except Exception as e:
             print(f"⚠️ Error checking headers: {e}")
 
     # Always keep the Tick_History header structure current.
     # This does not rewrite or delete existing tick data.
     try:
-        history_sheet.range("A1:AA1").value = headers
-        history_sheet.range("B:B").number_format = "yyyy-mm-dd hh:mm:ss"
+        history_sheet.range("A1:AE1").value = headers
+        history_sheet.range("A:C").number_format = "@"
     except Exception as e:
         print(f"⚠️ Could not refresh Tick_History headers: {e}")
 
@@ -685,26 +592,32 @@ def get_or_create_workbook():
         tick_counter = 0
 
     # New sheet for aggregated candles - KEEP EXISTING DATA
-    candle_sheet_name = "Candles"
+    # Reuse the existing candle sheet. Prefer the user's existing "Candel" sheet;
+    # otherwise reuse/create "Candles". Never create a second candle sheet on restart.
+    if "candel" in sheet_names:
+        candle_sheet_name = next(s.name for s in wb.sheets if s.name.lower() == "candel")
+    elif "candles" in sheet_names:
+        candle_sheet_name = next(s.name for s in wb.sheets if s.name.lower() == "candles")
+    else:
+        candle_sheet_name = "Candel"
     if candle_sheet_name.lower() not in sheet_names:
         candle_sheet = wb.sheets.add(candle_sheet_name)
         # Create headers for new candle sheet with IV
         candle_headers = [
             "Time", "Close",
-            "Call Strike", "Call IV", "Call OI", "Call Change OI", "Call Bid-Ask Avg",
+            "Call Strike", "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI", "Call Bid-Ask Avg",
             "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
-            "Put Strike", "Put IV", "Put OI", "Put Change OI", "Put Bid-Ask Avg",
+            "Put Strike", "Put LTP", "Put Volume", "Put IV", "Put OI", "Put Change OI", "Put Bid-Ask Avg",
             "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
             "PCR OI", "PCR Change OI",
             "Ticks"
         ]
-        candle_sheet.range("A2").value = candle_headers
-        candle_sheet.range("A1").value = f"{AGGREGATION_INTERVAL}-Minute Candle Data"
+        candle_sheet.range("A1").value = candle_headers
     else:
         candle_sheet = wb.sheets[candle_sheet_name]
         # Check if headers exist
         try:
-            header_check = candle_sheet.range("A2").value
+            header_check = candle_sheet.range("A1").value
             if header_check is None or header_check == "":
                 candle_headers = [
                     "Time", "Close",
@@ -716,10 +629,9 @@ def get_or_create_workbook():
                     "PCR OI", "PCR Change OI",
                     "Ticks"
                 ]
-                candle_sheet.range("A2:U2").value = [candle_headers]
+                candle_sheet.range("A1:Y1").value = [candle_headers]
         except Exception:
             pass
-        candle_sheet.range("A1").value = f"{AGGREGATION_INTERVAL}-Minute Candle Data"
 
     try:
         if "sheet1" in sheet_names and len(wb.sheets) > 2:
@@ -733,7 +645,7 @@ def get_or_create_workbook():
 
     print(
         f"📍 Real Tick_History last row: {get_last_actual_row(history_sheet, 'A', 1)} | "
-        f"Real Candles last row: {get_last_actual_row(candle_sheet, 'A', 2)}"
+        f"Real Candles last row: {get_last_actual_row(candle_sheet, 'A', 1)}"
     )
 
     wb.save()
@@ -744,14 +656,12 @@ def get_or_create_workbook():
 # Function to check Tick_History status
 # ----------------------------------------------------------------------
 def check_tick_history_status(history_sheet):
-    """Debug function to check Tick_History sheet status and initialize the append pointer."""
-    global history_next_row
+    """Debug function to check Tick_History sheet status"""
     try:
         print("🔍 Checking Tick_History status...")
         
         # Check if sheet exists
         last_row = get_last_actual_row(history_sheet, "A", 1)
-        history_next_row = max(2, last_row + 1)
         print(f"   Used range rows: {last_row}")
         
         if last_row >= 1:
@@ -775,42 +685,6 @@ def check_tick_history_status(history_sheet):
     except Exception as e:
         print(f"⚠️ Error checking Tick_History: {e}")
         return False
-
-
-# ----------------------------------------------------------------------
-# Flush buffered Tick_History rows in ONE Excel COM operation.
-# ----------------------------------------------------------------------
-def flush_pending_history(history_sheet, force=False):
-    global pending_history_rows, history_next_row, last_history_flush_time
-
-    if not pending_history_rows:
-        return 0
-
-    now_mono = time.monotonic()
-    if not force and (now_mono - last_history_flush_time) < HISTORY_FLUSH_INTERVAL:
-        return 0
-
-    rows = pending_history_rows
-    pending_history_rows = []
-
-    try:
-        if history_next_row is None:
-            history_next_row = get_last_actual_row(history_sheet, "A", 1) + 1
-            history_next_row = max(2, history_next_row)
-
-        start = history_next_row
-        end = start + len(rows) - 1
-        history_sheet.range(f"A{start}:AA{end}").value = rows
-        history_sheet.range(f"B{start}:B{end}").number_format = "yyyy-mm-dd hh:mm:ss"
-        history_sheet.range(f"D{start}:AA{end}").number_format = "#,##0.00"
-        history_next_row = end + 1
-        last_history_flush_time = now_mono
-        return len(rows)
-    except Exception as e:
-        # Put rows back so data is not lost if Excel temporarily rejects COM.
-        pending_history_rows = rows + pending_history_rows
-        print(f"⚠️ Tick_History batch write failed: {e}")
-        return 0
 
 
 # ----------------------------------------------------------------------
@@ -896,27 +770,28 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         if last_row < 2:
             return 0
 
-        # HIGH-SPEED: only read enough recent history to build the current
-        # candle. Historical candle rows are never needed here.
-        # At normal tick rates this is many times smaller than the full sheet.
-        rows_to_read = max(300, int(interval_minutes * 120))
-        first_row = max(2, last_row - rows_to_read + 1)
-        recent_values = history_sheet.range(f"A1:AA{last_row}").value if first_row <= 2 else history_sheet.range(f"A1:AA1").value + history_sheet.range(f"A{first_row}:AA{last_row}").value
-        if not recent_values:
-            return 0
+        # Only the ticks belonging to the CURRENT candle are needed here.
+        # Reading the entire Tick_History sheet on every refresh (the old
+        # behaviour) means this COM read + DataFrame build gets slower all
+        # day as history grows - it's the main reason things crawl by the
+        # afternoon. Bound the read to a recent window instead: generously
+        # more rows than any single interval could accumulate even at the
+        # fastest allowed refresh rate (0.05s -> ~1200 ticks/min).
+        LOOKBACK_ROWS = max(500, interval_minutes * 1500)
+        start_row = max(2, last_row - LOOKBACK_ROWS + 1)
 
-        if first_row <= 2:
-            headers = recent_values[0]
-            data_rows = recent_values[1:]
-        else:
-            headers = history_sheet.range("A1:AA1").value
-            data_rows = history_sheet.range(f"A{first_row}:AA{last_row}").value
+        headers = history_sheet.range("A1:AE1").value
+        data_rows = history_sheet.range(f"A{start_row}:AE{last_row}").value
+        if not data_rows:
+            return 0
+        if data_rows and not isinstance(data_rows[0], list):
+            data_rows = [data_rows]  # xlwings flattens a single-row read
         df = pd.DataFrame(data_rows, columns=headers)
 
         required = [
-            "Request Time", "Spot", "OTM Call Strike", "Call IV", "Call OI", "Call Change OI",
+            "Request Time", "Spot", "OTM Call Strike", "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI",
             "Call Total Buy", "Call Total Sell", "Call Bid", "Call Ask",
-            "OTM Put Strike", "Put IV", "Put OI", "Put Change OI", "Put Total Buy",
+            "OTM Put Strike", "Put LTP", "Put Volume", "Put IV", "Put OI", "Put Change OI", "Put Total Buy",
             "Put Total Sell", "Put Bid", "Put Ask", "PCR OI", "PCR Change OI"
         ]
 
@@ -931,9 +806,9 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         df["datetime"] = df["Request Time"].apply(_parse_tick_datetime)
 
         numeric_cols = [
-            "Spot", "OTM Call Strike", "Call IV", "Call OI", "Call Change OI",
+            "Spot", "OTM Call Strike", "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI",
             "Call Total Buy", "Call Total Sell", "Call Bid", "Call Ask",
-            "OTM Put Strike", "Put IV", "Put OI", "Put Change OI", "Put Total Buy",
+            "OTM Put Strike", "Put LTP", "Put Volume", "Put IV", "Put OI", "Put Change OI", "Put Total Buy",
             "Put Total Sell", "Put Bid", "Put Ask", "PCR OI", "PCR Change OI"
         ]
 
@@ -952,20 +827,11 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         df = df.sort_values("datetime").reset_index(drop=True)
 
         # ------------------------------------------------------------
-        # MARKET HOURS
+        # RUN WINDOW
         # ------------------------------------------------------------
-        minute_of_day = (
-            df["datetime"].dt.hour * 60
-            + df["datetime"].dt.minute
-        )
-
-        df = df[
-            (minute_of_day >= MARKET_START) &
-            (minute_of_day <= MARKET_END)
-        ].copy()
-
-        if df.empty:
-            return 0
+        # Tick_History has already been filtered by store_tick_data.
+        # Do not apply a second 15:30 cutoff here; otherwise the optional
+        # post-market candle window would always remain blank.
 
         # ------------------------------------------------------------
         # IMPORTANT:
@@ -1020,6 +886,8 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
             candle_time,
             float(last["Spot"]),
             float(last["OTM Call Strike"]),
+            float(last["Call LTP"]),
+            float(last["Call Volume"]),
             float(last["Call IV"]),
             float(current_group["Call OI"].mean()),
             float(last["Call Change OI"]),
@@ -1028,6 +896,8 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
             float(call_sell),
             float(call_buy - call_sell),
             float(last["OTM Put Strike"]),
+            float(last["Put LTP"]),
+            float(last["Put Volume"]),
             float(last["Put IV"]),
             float(current_group["Put OI"].mean()),
             float(last["Put Change OI"]),
@@ -1043,29 +913,21 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         # ------------------------------------------------------------
         # HEADERS ONLY IF MISSING
         # NEVER REWRITE THEM EVERY REFRESH.
+        # Header row moved to row 1 - the "N-Minute Candle Data" title is
+        # dropped since that interval is already shown on OptionChain!B4.
         # ------------------------------------------------------------
-        candle_title = f"{interval_minutes}-Minute Candle Data"
-
-        try:
-            current_title = candle_sheet.range("A1").value
-        except Exception:
-            current_title = None
-
-        if str(current_title or "").strip() != candle_title:
-            candle_sheet.range("A1").value = candle_title
-
         candle_headers = [
 "Time", "Close",
-            "Call Strike", "Call IV", "Call OI", "Call Change OI", "Call Bid-Ask Avg",
+            "Call Strike", "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI", "Call Bid-Ask Avg",
             "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
-            "Put Strike", "Put IV", "Put OI", "Put Change OI", "Put Bid-Ask Avg",
+            "Put Strike", "Put LTP", "Put Volume", "Put IV", "Put OI", "Put Change OI", "Put Bid-Ask Avg",
             "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
             "PCR OI", "PCR Change OI",
             "Ticks"
         ]
 
         try:
-            current_headers = candle_sheet.range("A2:U2").value
+            current_headers = candle_sheet.range("A1:Y1").value
             if current_headers and isinstance(current_headers, list):
                 if len(current_headers) == 1 and isinstance(
                     current_headers[0], list
@@ -1075,29 +937,30 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
             current_headers = None
 
         if current_headers != candle_headers:
-            candle_sheet.range("A2:U2").value = [candle_headers]
+            candle_sheet.range("A1:Y1").value = [candle_headers]
 
         # ------------------------------------------------------------
         # FIND ONLY THE LAST CANDLE ROW
         #
-        # We intentionally DO NOT read rows 3:N.
+        # We intentionally DO NOT read rows 2:N.
         # Only the latest row matters.
         # ------------------------------------------------------------
         try:
-            candle_last_row = get_last_actual_row(candle_sheet, "A", 2)
+            candle_last_row = get_last_actual_row(candle_sheet, "A", 1)
         except Exception:
-            candle_last_row = 2
+            candle_last_row = 1
 
-        if candle_last_row < 3:
+        if candle_last_row < 2:
             # No candle exists yet -> add the first one.
-            target_row = 3
+            target_row = 2
 
             candle_sheet.range(
-                f"A{target_row}:U{target_row}"
+                f"A{target_row}:Y{target_row}"
             ).value = [new_values]
 
+            candle_sheet.range(f"A{target_row}").number_format = "@"
             candle_sheet.range(
-                f"B{target_row}:S{target_row}"
+                f"B{target_row}:Y{target_row}"
             ).number_format = "#,##0.00"
 
             print(
@@ -1110,7 +973,7 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         # READ ONLY THE LAST ROW
         # ------------------------------------------------------------
         last_row_values = candle_sheet.range(
-            f"A{candle_last_row}:U{candle_last_row}"
+            f"A{candle_last_row}:Y{candle_last_row}"
         ).value
 
         if last_row_values and isinstance(last_row_values, list):
@@ -1243,7 +1106,7 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
 
             # One row ONLY.
             candle_sheet.range(
-                f"A{candle_last_row}:U{candle_last_row}"
+                f"A{candle_last_row}:Y{candle_last_row}"
             ).value = [new_values]
 
             candle_sheet.range(
@@ -1264,7 +1127,7 @@ def aggregate_candles(history_sheet, candle_sheet, interval_minutes):
         target_row = candle_last_row + 1
 
         candle_sheet.range(
-            f"A{target_row}:U{target_row}"
+            f"A{target_row}:Y{target_row}"
         ).value = [new_values]
 
         candle_sheet.range(
@@ -1320,156 +1183,66 @@ def get_last_actual_row(sheet, column="A", header_row=1):
 # FIX / MIGRATE EXISTING CANDLES SHEET
 # ----------------------------------------------------------------------
 def fix_candle_column_order(candle_sheet):
-    """
-    IMPORTANT:
-    Older versions stored Call Change OI in Q and Put Change OI in R.
+    """Ensure one canonical 25-column Candel/Candles layout.
 
-    Old layout:
-    A Time
-    B Close
-    C Call Strike
-    D Call IV
-    E Call OI
-    F Call Bid-Ask Avg
-    G Call Total Buy
-    H Call Total Sell
-    I Call Buy-Sell Diff
-    J Put Strike
-    K Put IV
-    L Put OI
-    M Put Bid-Ask Avg
-    N Put Total Buy
-    O Put Total Sell
-    P Put Buy-Sell Diff
-    Q Call Change OI
-    R Put Change OI
-    S PCR OI
-    T PCR Change OI
-    U Ticks
-
-    New layout:
-    A Time
-    B Close
-    C Call Strike
-    D Call IV
-    E Call OI
-    F Call Change OI
-    G Call Bid-Ask Avg
-    H Call Total Buy
-    I Call Total Sell
-    J Call Buy-Sell Diff
-    K Put Strike
-    L Put IV
-    M Put OI
-    N Put Change OI
-    O Put Bid-Ask Avg
-    P Put Total Buy
-    Q Put Total Sell
-    R Put Buy-Sell Diff
-    S PCR OI
-    T PCR Change OI
-    U Ticks
-
-    This physically moves the EXISTING rows. Changing only the header
-    does not fix old data, which was the source of the user's problem.
+    Old candle files had 21 columns. New files include Call/Put LTP and
+    Volume, so we migrate old rows without creating another sheet.
     """
     headers = [
         "Time", "Close",
-        "Call Strike", "Call IV", "Call OI", "Call Change OI",
-        "Call Bid-Ask Avg", "Call Total Buy", "Call Total Sell",
-        "Call Buy-Sell Diff",
-        "Put Strike", "Put IV", "Put OI", "Put Change OI",
-        "Put Bid-Ask Avg", "Put Total Buy", "Put Total Sell",
-        "Put Buy-Sell Diff", "PCR OI", "PCR Change OI", "Ticks"
+        "Call Strike", "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI",
+        "Call Bid-Ask Avg", "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
+        "Put Strike", "Put LTP", "Put Volume", "Put IV", "Put OI", "Put Change OI",
+        "Put Bid-Ask Avg", "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
+        "PCR OI", "PCR Change OI", "Ticks"
     ]
-
     try:
-        last_row = get_last_actual_row(candle_sheet, "A", 2)
-        if last_row < 2:
-            candle_sheet.range("A2:U2").value = [headers]
+        last_row = get_last_actual_row(candle_sheet, "A", 1)
+        if last_row < 1:
+            candle_sheet.range("A1:Y1").value = [headers]
             return
 
-        raw = candle_sheet.range(f"A2:U{last_row}").value
-        if not raw:
-            candle_sheet.range("A2:U2").value = [headers]
-            return
-
-        # Flatten one-row return if xlwings gives it that way.
-        if isinstance(raw, list) and raw and not isinstance(raw[0], list):
+        raw = candle_sheet.range(f"A1:Y{last_row}").value
+        if raw and raw and not isinstance(raw[0], list):
             raw = [raw]
-
-        first = raw[0] if raw else []
+        first = list(raw[0]) if raw else []
         first_norm = [str(x).strip() if x is not None else "" for x in first]
 
-        new_norm = [str(x) for x in headers]
-
-        # Detect the OLD layout by its exact identifying positions.
-        old_layout = (
-            len(first_norm) >= 21 and
-            first_norm[4] == "Call OI" and
-            first_norm[5] == "Call Bid-Ask Avg" and
-            first_norm[15] == "Put Buy-Sell Diff" and
-            first_norm[16] == "Call Change OI" and
-            first_norm[17] == "Put Change OI"
-        )
-
-        # Detect whether row 2 is already the new header.
-        already_new = first_norm[:21] == new_norm
-
-        if old_layout:
-            print("🔧 Migrating existing Candles columns: Q→F and R→N...")
-
-            old_data = raw[1:]  # exclude old header
-
-            migrated = []
-            for row in old_data:
-                row = list(row) + [None] * (21 - len(row))
-                migrated.append([
-                    row[0],   # A Time
-                    row[1],   # B Close
-                    row[2],   # C Call Strike
-                    row[3],   # D Call IV
-                    row[4],   # E Call OI
-                    row[16],  # F Call Change OI  <-- OLD Q
-                    row[5],   # G Call Bid-Ask Avg
-                    row[6],   # H Call Total Buy
-                    row[7],   # I Call Total Sell
-                    row[8],   # J Call Buy-Sell Diff
-                    row[9],   # K Put Strike
-                    row[10],  # L Put IV
-                    row[11],  # M Put OI
-                    row[17],  # N Put Change OI  <-- OLD R
-                    row[12],  # O Put Bid-Ask Avg
-                    row[13],  # P Put Total Buy
-                    row[14],  # Q Put Total Sell
-                    row[15],  # R Put Buy-Sell Diff
-                    row[18],  # S PCR OI
-                    row[19],  # T PCR Change OI
-                    row[20],  # U Ticks
-                ])
-
-            # Clear and rewrite ONLY the Candles table once, during startup
-            # migration. Normal live refreshes never rewrite old rows.
-            candle_sheet.range(f"A2:U{last_row}").clear_contents()
-            candle_sheet.range("A2:U2").value = [headers]
-
-            if migrated:
-                candle_sheet.range(
-                    f"A3:U{2 + len(migrated)}"
-                ).value = migrated
-
-            print(
-                f"✅ Candles migration complete: {len(migrated)} historical rows fixed."
-            )
+        if first_norm[:25] == headers:
+            print("✅ Candles column order already correct.")
             return
 
-        if not already_new:
-            # New sheet or unusual header: set the correct header.
-            candle_sheet.range("A2:U2").value = [headers]
-            print("✅ Candles header set to corrected order.")
-        else:
-            print("✅ Candles column order already correct.")
+        # Old 21-column layout from the previous working versions.
+        old_headers = [
+            "Time", "Close", "Call Strike", "Call IV", "Call OI", "Call Bid-Ask Avg",
+            "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff", "Put Strike", "Put IV",
+            "Put OI", "Put Bid-Ask Avg", "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
+            "Call Change OI", "Put Change OI", "PCR OI", "PCR Change OI", "Ticks"
+        ]
 
+        data = raw[1:] if first_norm[:21] == old_headers else []
+        if data:
+            migrated = []
+            for row in data:
+                r = list(row) + [None] * max(0, 21-len(row))
+                # We cannot recover historical LTP/Volume if they were never stored.
+                migrated.append([
+                    r[0], r[1], r[2], 0.0, 0.0, r[3], r[4], r[16], r[5],
+                    r[6], r[7], r[8], r[9], 0.0, 0.0, r[10], r[11], r[17],
+                    r[12], r[13], r[14], r[15], r[18], r[19], r[20]
+                ])
+            candle_sheet.range(f"A1:Y{last_row}").clear_contents()
+            candle_sheet.range("A1:Y1").value = [headers]
+            if migrated:
+                candle_sheet.range(f"A2:Y{1+len(migrated)}").value = migrated
+            print(f"🔧 Migrated {len(migrated)} old candle rows to canonical LTP/Volume layout.")
+        else:
+            # Unknown/malformed header: fix only the header; do not create a sheet.
+            candle_sheet.range("A1:Y1").value = [headers]
+            print("🔧 Repaired Candel headers to canonical 25-column layout.")
+
+        candle_sheet.range("A:A").number_format = "@"
+        candle_sheet.range("B:Y").number_format = "#,##0.00"
     except Exception as e:
         print(f"⚠️ Candles column migration error: {e}")
 
@@ -1646,7 +1419,6 @@ def get_auth_code_via_selenium(client_id, user_id, password, totp_secret):
 # OAuth login with existing token check
 # ----------------------------------------------------------------------
 def _make_api():
-    """Create a clean Shoonya OAuth API object."""
     class ShoonyaApiPy(NorenApi):
         def __init__(self):
             super().__init__(
@@ -1656,260 +1428,118 @@ def _make_api():
     return ShoonyaApiPy()
 
 
-def _install_oauth_session(api_obj, uid, token, actid):
-    """
-    Restore BOTH the normal Noren identity fields and the OAuth HTTP
-    Authorization header.  The latter is important for the OAuth
-    WebSocket flow.
-    """
-    api_obj.uid = uid
-    api_obj.token = token
-    api_obj.actid = actid
+def _load_saved_session(login_data):
+    """Load the saved token without calling any validation REST API."""
+    global api
+    if not login_data.get("token") or not login_data.get("usertoken"):
+        return False
+    api = _make_api()
+    api.uid = login_data["usertoken"]
+    api.token = login_data["token"]
+    api.actid = login_data.get("user_id") or login_data["usertoken"]
+    print("✅ REUSING SAVED TOKEN")
+    print("   🔐 No token validation API call")
+    print("   🔐 No browser login")
+    return True
 
+
+def _login_from_auth_code(login_sheet, login_data, auth_code):
+    global api
+    if not auth_code:
+        return False
+    api = _make_api()
+    print("🔄 Calling getAccessToken() using saved AUTH CODE...")
+    result = api.getAccessToken(
+        auth_code,
+        login_data["secret_code"],
+        login_data["client_id"],
+        login_data["user_id"],
+    )
+    print(f"getAccessToken() raw result: {result}")
+    if result is None:
+        print("❌ Saved AUTH CODE returned None.")
+        return False
     try:
-        header = api_obj.injectOAuthHeader(token)
-        print("   ✅ OAuth HTTP header/session restored")
-        return header
-    except Exception as e:
-        print(f"   ⚠️ injectOAuthHeader() failed: {e}")
-        return None
-
-
-def _apply_access_token_result(api_obj, result, login_sheet, auth_code):
-    """Save and install a successful getAccessToken() result."""
-    if not result or not isinstance(result, (tuple, list)) or len(result) < 4:
+        acc_tok, usrid, ref_tok, actid = result
+    except Exception:
+        print("❌ Unexpected getAccessToken() response.")
         return False
-
-    acc_tok, usrid, ref_tok, actid = result
-
-    if not acc_tok or not usrid:
-        return False
-
-    _install_oauth_session(api_obj, usrid, acc_tok, actid)
-
     update_login_data(login_sheet, auth_code, acc_tok, usrid)
-
-    login_sheet.range("C2").value = f"Login OK - {usrid}"
-    print(f"✅ Login successful! User: {usrid}")
-    print(f"   Auth Code saved: {str(auth_code)[:20]}...")
-    print(f"   Token saved: {str(acc_tok)[:20]}...")
-    print(f"   UserToken saved: {str(usrid)[:20]}...")
-    print("   Token timestamp saved to Excel")
+    api.uid = usrid
+    api.token = acc_tok
+    api.actid = actid or usrid
+    print(f"✅ AUTH CODE produced fresh access token for {usrid}")
     return True
 
 
 def shoonya_login(login_sheet):
-    """
-    Login/re-login policy:
-
-    1. Try SAVED ACCESS TOKEN first.
-    2. If saved token cannot be used, try the AUTH CODE already stored
-       in Login!  NO browser login at this stage.
-    3. If getAccessToken(auth_code, ...) returns None, treat that saved
-       AUTH CODE as expired/invalid and ONLY THEN perform a fresh browser
-       OAuth login.
-    4. If fresh browser OAuth returns an auth code, exchange it for a token.
-    5. Never stop merely because the saved auth code returned None.
-    """
+    """Login order: saved TOKEN -> saved AUTH CODE -> browser only if AUTH CODE returns None."""
     global api
-
     login_data = get_all_login_data(login_sheet)
 
-    user_id = login_data["user_id"]
-    client_id = login_data["client_id"] or f"{user_id}_U"
-    secret_code = login_data["secret_code"]
-    saved_auth_code = login_data["auth_code"]
-    saved_token = login_data["token"]
-    saved_usertoken = login_data["usertoken"] or user_id
-
     print("🔐 LOGIN POLICY:")
-    print("   1. Saved TOKEN")
+    print("   1. Saved TOKEN (no validation API call)")
     print("   2. Saved AUTH CODE")
-    print("   3. Fresh browser OAuth ONLY if saved AUTH CODE returns None")
+    print("   3. Fresh browser OAuth ONLY when saved AUTH CODE returns None")
 
-    if not user_id or not secret_code:
-        login_sheet.range("C2").value = "Missing User ID / Secret Code"
-        print("❌ Missing User ID or Secret Code in Login sheet.")
-        return False
-
-    # ==============================================================
-    # STEP 1 — SAVED TOKEN FIRST
-    # ==============================================================
-    if saved_token and saved_usertoken:
-        print("--------------------------------------------------")
-        print("🔐 STEP 1: Trying SAVED ACCESS TOKEN")
-        print(f"   User ID : {user_id}")
-        print(f"   Token   : {str(saved_token)[:20]}...")
-        print(f"   ACTID   : {user_id}")
-
-        try:
-            api = _make_api()
-            _install_oauth_session(api, saved_usertoken, saved_token, user_id)
-
-            # Small HTTP test.  This is NOT used to create a new token.
-            # It only tells us whether the saved session can currently
-            # talk to the broker.
-            test = api.get_quotes(SPOT_EXCHANGE, str(NIFTY_SPOT_TOKEN))
-
-            if test and test.get("lp") not in (None, "", "0", 0):
-                login_sheet.range("C2").value = f"Saved token reused - {user_id}"
-                print(f"✅ REUSING SAVED TOKEN for user: {user_id}")
-                print(f"   NIFTY spot response: {test.get('lp')}")
-                print("   🔐 No OAuth browser login")
-                print("   🔐 No new auth code")
-                return True
-
-            print("❌ Saved token did not return usable market data.")
-        except Exception as e:
-            print(f"❌ Saved token/session failed: {e}")
-
-    # ==============================================================
-    # STEP 2 — SAVED AUTH CODE
-    # ==============================================================
-    if saved_auth_code:
-        print("--------------------------------------------------")
-        print("🔐 STEP 2: Trying AUTH CODE already stored in Login sheet")
-        print(f"   Auth Code: {str(saved_auth_code)[:25]}...")
-        print("   🚫 No browser login yet")
-        print("   🔄 Calling EXACT getAccessToken(auth_code, secret, client_id, uid)...")
-
-        try:
-            api = _make_api()
-
-            result = api.getAccessToken(
-                saved_auth_code,
-                secret_code,
-                client_id,
-                user_id
-            )
-
-            print("getAccessToken() raw result:", result)
-
-            if _apply_access_token_result(
-                api, result, login_sheet, saved_auth_code
-            ):
-                print("✅ Saved AUTH CODE produced a fresh access token.")
-                return True
-
-            # IMPORTANT:
-            # For this program, None/invalid tuple means the saved AUTH
-            # CODE is no longer usable.  NOW, and only now, do browser OAuth.
-            print("❌ getAccessToken() returned None/invalid result.")
-            print("   ➜ Treating saved AUTH CODE as expired/invalid.")
-        except Exception as e:
-            print(f"❌ Saved AUTH CODE exchange raised an error: {e}")
-            print("   ➜ Treating saved AUTH CODE as unusable.")
-
-    else:
-        print("--------------------------------------------------")
-        print("⚠️ No saved AUTH CODE in Login sheet.")
-
-    # ==============================================================
-    # STEP 3 — FRESH BROWSER OAUTH
-    # ==============================================================
-    print("--------------------------------------------------")
-    print("🔄 STEP 3: FRESH OAuth browser login")
-    print("   This happens ONLY after saved TOKEN + saved AUTH CODE fail.")
-
-    if not login_data["password"] or not login_data["totp_secret"]:
-        login_sheet.range("C2").value = (
-            "Saved token/auth code failed; Password/TOTP required for fresh OAuth"
-        )
-        print("❌ Password or TOTP Secret missing; cannot perform fresh OAuth.")
-        return False
-
-    try:
-        api = _make_api()
-
-        login_sheet.range("C2").value = "Opening browser for fresh OAuth..."
-        print(f"   User ID  : {user_id}")
-        print(f"   Client ID: {client_id}")
-        print("   Opening browser for OAuth login...")
-
-        fresh_auth_code = get_auth_code_via_selenium(
-            client_id,
-            user_id,
-            login_data["password"],
-            login_data["totp_secret"]
-        )
-
-        if not fresh_auth_code:
-            print("❌ Browser OAuth did not return an AUTH CODE.")
-            login_sheet.range("C2").value = "Fresh OAuth auth code not received"
-            return False
-
-        print(f"   OAuth authorization code received: {str(fresh_auth_code)[:25]}...")
-        print("   Getting access token...")
-
-        fresh_result = api.getAccessToken(
-            fresh_auth_code,
-            secret_code,
-            client_id,
-            user_id
-        )
-
-        print("Fresh getAccessToken() raw result:", fresh_result)
-
-        if not _apply_access_token_result(
-            api, fresh_result, login_sheet, fresh_auth_code
-        ):
-            print("❌ Fresh AUTH CODE also failed to produce a token.")
-            login_sheet.range("C2").value = "Fresh OAuth token exchange failed"
-            return False
-
-        print("✅ Fresh OAuth login completed.")
+    if _load_saved_session(login_data):
         return True
 
-    except Exception as e:
-        print(f"❌ Fresh OAuth login error: {e}")
-        import traceback
-        traceback.print_exc()
-        login_sheet.range("C2").value = f"OAuth error: {str(e)[:120]}"
+    if not login_data.get("user_id") or not login_data.get("secret_code"):
+        print("❌ Missing User ID or OAuth Secret Code in Login sheet.")
         return False
+
+    if login_data.get("auth_code"):
+        if _login_from_auth_code(login_sheet, login_data, login_data["auth_code"]):
+            return True
+
+    # Only this path is allowed to generate a new auth code.
+    print("⚠️ Saved AUTH CODE returned None/failed.")
+    print("🔄 NOW and ONLY NOW opening browser for a fresh OAuth code...")
+    if not login_data.get("password") or not login_data.get("totp_secret"):
+        print("❌ Password/TOTP missing; cannot perform fresh browser login.")
+        return False
+
+    api = _make_api()
+    auth_code = get_auth_code_via_selenium(
+        login_data["client_id"], login_data["user_id"],
+        login_data["password"], login_data["totp_secret"]
+    )
+    if not auth_code:
+        print("❌ Browser did not return an OAuth code.")
+        return False
+    return _login_from_auth_code(login_sheet, login_data, auth_code)
 
 
 # ----------------------------------------------------------------------
 # WebSocket callbacks
 # ----------------------------------------------------------------------
 def event_handler_quote_update(msg):
-    """Fast WebSocket callback.
-
-    Only changed market fields increment market_data_version.  The main loop
-    can therefore skip all dataframe/Excel work when the broker sends no new
-    market information.
-    """
-    global live_data, feed_time, last_traded_time, market_data_version
-
+    global live_data, feed_time, last_traded_time
+    
     fields = ["ts", "lp", "pc", "c", "o", "h", "l", "v", "ltq", "ltp",
               "bp1", "sp1", "bq1", "sq1", "ap", "oi", "poi", "toi",
               "tbq", "tsq", "ft", "exch_tm", "ltt"]
-    key = msg.get("e", "") + "|" + msg.get("tk", "")
-    if not key or key == "|":
-        return
-
-    old = live_data.get(key, {})
-    changed = False
-    for f in fields:
-        if f in msg and old.get(f) != msg[f]:
-            changed = True
-            break
-
-    if changed:
-        live_data[key] = {**old, **{f: msg[f] for f in fields if f in msg}}
-        market_data_version += 1
-    elif key not in live_data:
-        live_data[key] = {f: msg[f] for f in fields if f in msg}
-        market_data_version += 1
-
+    message = {f: msg[f] for f in set(fields) & set(msg.keys())}
+    key = msg["e"] + "|" + msg["tk"]
+    live_data[key] = {**live_data.get(key, {}), **message}
+    
+    # IMPORTANT: Shoonya field `ts` is the trading symbol (for example Nifty 50),
+    # NOT a timestamp. Never put `ts` into Feed Time or Last Traded Time.
     if 'ft' in msg:
-        feed_time = format_timestamp(msg['ft'])
+        _ft = format_feed_datetime(msg['ft'])
+        if _ft:
+            feed_time = _ft
     elif 'exch_tm' in msg:
-        feed_time = format_timestamp(msg['exch_tm'])
-    elif 'ts' in msg:
-        feed_time = format_timestamp(msg['ts'])
+        _ft = format_feed_datetime(msg['exch_tm'])
+        if _ft:
+            feed_time = _ft
 
+    # Last Traded Time comes only from ltt.
     if 'ltt' in msg:
-        last_traded_time = format_timestamp(msg['ltt'])
+        _ltt = format_timestamp(msg['ltt'])
+        if _ltt:
+            last_traded_time = _ltt
 
     if not last_traded_time and feed_time:
         last_traded_time = feed_time
@@ -2000,38 +1630,84 @@ def dump_available_expiries(oc_sheet):
     oc_sheet.range("D1").options(transpose=True).value = [str(e.strftime("%d-%m-%Y")) for e in expiries]
 
 
+def _nearest_upcoming_expiry(today=None):
+    """Return the nearest expiry date >= today from the loaded NIFTY chain
+    (falls back to the nearest overall expiry if every listed one has
+    already passed)."""
+    if today is None:
+        today = dt.now(IST).date()
+    matches = [t for t in OptionChain_template if t["symbol"] == SYMBOL]
+    if not matches:
+        return None
+    expiries = sorted(e["Expiry"] for e in matches[0]["Expiry_Strike_token"])
+    if not expiries:
+        return None
+    upcoming = [e for e in expiries if e >= today]
+    return upcoming[0] if upcoming else expiries[-1]
+
+
+def _auto_select_expiry_if_blank(oc_sheet, announce=True):
+    """If B1 (Expiry) is empty, fill it with the nearest upcoming expiry so
+    the tool can run without requiring a manual date first. Returns the
+    (possibly auto-filled) expiry string currently in B1."""
+    expiry_str = oc_sheet.range("B1").value
+    if expiry_str:
+        return expiry_str
+
+    nearest = _nearest_upcoming_expiry()
+    if nearest is None:
+        return expiry_str
+
+    expiry_str = nearest.strftime("%d-%m-%Y")
+    oc_sheet.range("B1").value = expiry_str
+    if announce:
+        print(f"🗓️ B1 (Expiry) was blank - auto-selected nearest expiry {expiry_str}")
+    return expiry_str
+
+
+def _report_blank_config_cells(oc_sheet):
+    """Print which of the core config cells (B1-B4) are currently blank, so
+    it's obvious from the console why defaults are being used."""
+    cell_labels = {
+        "B1": "Expiry (dd-mm-yyyy)",
+        "B2": "NoOfStrikes each side",
+        "B3": "RefreshRate(sec)",
+        "B4": "Aggregation Interval (min)",
+    }
+    blanks = [f"{cell} [{label}]" for cell, label in cell_labels.items()
+              if not oc_sheet.range(cell).value]
+    if blanks:
+        print(f"⚠️ Blank config cells (defaults will be used): {', '.join(blanks)}")
+    else:
+        print("✅ B1-B4 config cells are all filled in.")
+
+
 # ============================================================
 # ATM HIGHLIGHT - GREEN BACKGROUND
 # ============================================================
-def apply_atm_highlight(oc_sheet, atm_strike):
+_last_atm_highlight_row = None
+
+
+def apply_atm_highlight(oc_sheet, row_num):
     """Highlight the ATM row in the OptionChain data area.
 
     OptionChain headers are on row 10 and data starts on row 11.
-    The highlight extends across all 27 displayed columns (A:AA).
+    row_num is computed by the caller directly from atm_idx/lo (it already
+    knows exactly which row ATM lands on) instead of clearing and reading
+    a 990x27 block back from Excel every refresh just to find it again.
+    Only the previous highlighted row (if it moved) and the new one are
+    touched - two small COM calls instead of two full-block ones.
     """
+    global _last_atm_highlight_row
     try:
-        # Clear only the displayed OptionChain data area.
-        oc_sheet.range("A11:AA1000").color = None
+        if row_num == _last_atm_highlight_row:
+            return  # ATM strike hasn't moved rows - nothing to do
 
-        data = oc_sheet.range("A11:AA1000").value
-        if not data or not isinstance(data, list):
-            return
+        if _last_atm_highlight_row is not None:
+            oc_sheet.range(f"A{_last_atm_highlight_row}:AA{_last_atm_highlight_row}").color = None
 
-        for i, row in enumerate(data):
-            if not row:
-                continue
-
-            # OptionChain columns:
-            # F = Call Strike, P = Put Strike (1-based Excel columns)
-            call_strike = convert_to_float(row[5]) if len(row) > 5 else None
-            put_strike = convert_to_float(row[15]) if len(row) > 15 else None
-
-            if ((call_strike is not None and abs(call_strike - atm_strike) < 0.01) or
-                (put_strike is not None and abs(put_strike - atm_strike) < 0.01)):
-                row_num = i + 11
-                oc_sheet.range(f"A{row_num}:AA{row_num}").color = (0, 255, 0)
-                print(f"✅ ATM Highlight applied to row {row_num} (ATM Strike: {atm_strike})")
-                break
+        oc_sheet.range(f"A{row_num}:AA{row_num}").color = (0, 255, 0)
+        _last_atm_highlight_row = row_num
 
     except Exception as e:
         print(f"⚠️ ATM highlight error: {e}")
@@ -2039,91 +1715,47 @@ def apply_atm_highlight(oc_sheet, atm_strike):
 # ----------------------------------------------------------------------
 # Function to get first OTM Call and Put strikes
 # ----------------------------------------------------------------------
-def get_nse_strike_classification(df_full, spot_ltp):
-    """
-    NSE-style strike classification using the ACTUAL strikes present in
-    the NFO instrument list.
-
-    Definitions:
-      CE:
-        ITM = strike < spot
-        ATM = nearest actual strike to spot
-        OTM = strike > spot
-
-      PE:
-        ITM = strike > spot
-        ATM = nearest actual strike to spot
-        OTM = strike < spot
-
-    The function NEVER invents a strike.  It selects from the actual
-    available NIFTY option strikes.
-    """
-    strikes = sorted(
-        pd.to_numeric(df_full["strike"], errors="coerce")
-        .dropna()
-        .unique()
-        .tolist()
-    )
-
-    if not strikes:
-        return {
-            "atm": None,
-            "ce_itm": None,
-            "ce_otm": None,
-            "pe_itm": None,
-            "pe_otm": None,
-        }
-
-    spot = float(spot_ltp)
-
-    # NSE option-chain ATM = nearest available strike.
-    atm = min(strikes, key=lambda x: (abs(x - spot), x))
-
-    below = [s for s in strikes if s < spot]
-    above = [s for s in strikes if s > spot]
-
-    # Call:
-    #   nearest strike below spot = first ITM CE
-    #   nearest strike above spot = first OTM CE
-    ce_itm = max(below) if below else None
-    ce_otm = min(above) if above else None
-
-    # Put:
-    #   nearest strike above spot = first ITM PE
-    #   nearest strike below spot = first OTM PE
-    pe_itm = min(above) if above else None
-    pe_otm = max(below) if below else None
-
-    return {
-        "atm": atm,
-        "ce_itm": ce_itm,
-        "ce_otm": ce_otm,
-        "pe_itm": pe_itm,
-        "pe_otm": pe_otm,
-    }
-
-
-def get_first_otm_strikes(df_full, spot_ltp, atm_strike=None, strike_step=50):
-    """
-    Compatibility wrapper used by the existing option-chain code.
-
-    IMPORTANT:
-    It uses the actual NSE/NFO strikes in df_full.
-    It does NOT calculate OTM as ATM +/- a hard-coded 50 if an actual
-    strike is available.
-    """
-    cls = get_nse_strike_classification(df_full, spot_ltp)
-
-    otm_call_strike = cls["ce_otm"]
-    otm_put_strike = cls["pe_otm"]
-
-    # Only as a final defensive fallback.
-    if otm_call_strike is None and atm_strike is not None:
+def get_first_otm_strikes(df_full, spot_ltp, atm_strike, strike_step=50):
+    """Get the first OTM Call (strike ABOVE spot) and first OTM Put (strike BELOW spot)
+    from the FULL dataframe before trimming"""
+    
+    # Get all unique strikes from the FULL dataframe
+    strikes = sorted(df_full["strike"].unique())
+    
+    # Find OTM Call (strike ABOVE spot, closest to spot) - LEFT side of Option Chain
+    otm_call_strike = None
+    
+    for strike in strikes:
+        if strike > spot_ltp:
+            otm_call_strike = strike
+            break
+    
+    # If no OTM Call found above spot, use ATM + step
+    if otm_call_strike is None:
         otm_call_strike = atm_strike + strike_step
-
-    if otm_put_strike is None and atm_strike is not None:
+        # Find the closest strike above ATM
+        for strike in strikes:
+            if strike > atm_strike:
+                otm_call_strike = strike
+                break
+    
+    # Find OTM Put (strike BELOW spot, closest to spot) - RIGHT side of Option Chain
+    otm_put_strike = None
+    
+    for strike in reversed(strikes):
+        if strike < spot_ltp:
+            otm_put_strike = strike
+            break
+    
+    # If no OTM Put found below spot, use ATM - step
+    if otm_put_strike is None:
         otm_put_strike = atm_strike - strike_step
-
+        # Find the closest strike below ATM
+        for strike in reversed(strikes):
+            if strike < atm_strike:
+                otm_put_strike = strike
+                break
+    
     return otm_call_strike, otm_put_strike
 
 
@@ -2135,7 +1767,7 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
     Store a market snapshot in Tick_History.
 
     IMPORTANT:
-    1. Never write after 15:30 IST.
+    1. Never write after 23:59 IST.
     2. Never write the same market snapshot twice.
        Request Time / Feed Time are NOT part of duplicate detection.
     3. If ANY real market value changes (Spot, OI, IV, Bid, Ask,
@@ -2150,14 +1782,19 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
         # ============================================================
         now_ist = dt.now(IST)
         market_minutes = now_ist.hour * 60 + now_ist.minute
-        market_end_minutes = MARKET_END
 
-        # Allow the final 15:30 snapshot, but NOTHING after 15:30:00.
-        if market_minutes > market_end_minutes:
+        # Normal market is always allowed. After-market can be enabled
+        # from OptionChain!B5 and stopped at OptionChain!B6.
+        if market_minutes < MARKET_START:
             return
 
-        if market_minutes == market_end_minutes and now_ist.second > 0:
-            return
+        if market_minutes > MARKET_END:
+            if not POST_MARKET_ENABLED:
+                return
+            if market_minutes > POST_MARKET_END:
+                return
+            if market_minutes == POST_MARKET_END and now_ist.second > 0:
+                return
 
         now_dt = now_ist.replace(tzinfo=None)
         request_time = now_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -2246,6 +1883,8 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
             convert_to_float(spot_ltp),
             convert_to_float(atm_strike),
             convert_to_float(otm_call_strike),
+            convert_to_float(call_data.get("CE_lp", 0)),
+            convert_to_float(call_data.get("CE_v", 0)),
             call_iv,
             convert_to_float(call_data.get("CE_oi", 0)),
             convert_to_float(call_data.get("CE_coi", 0)),
@@ -2258,6 +1897,8 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
             convert_to_float(call_data.get("CE_sp1", 0)) -
             convert_to_float(call_data.get("CE_bp1", 0)),
             convert_to_float(otm_put_strike),
+            convert_to_float(put_data.get("PE_lp", 0)),
+            convert_to_float(put_data.get("PE_v", 0)),
             put_iv,
             convert_to_float(put_data.get("PE_oi", 0)),
             convert_to_float(put_data.get("PE_coi", 0)),
@@ -2292,18 +1933,18 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
         # ------------------------------------------------------------
         if not feed_time:
             feed_time = now_dt.strftime("%H:%M:%S")
-        if not last_traded_time:
-            last_traded_time = feed_time
+        if not last_traded_time or last_traded_time in ("Nifty 50", "NIFTY 50"):
+            last_traded_time = feed_time if feed_time else now_dt.strftime("%H:%M:%S")
 
         # Use current exchange/feed timestamp when available; otherwise
         # keep the existing value maintained by the main loop.
         headers = [
             "Feed Time", "Request Time", "Last Traded Time",
             "Spot", "ATM Strike",
-            "OTM Call Strike", "Call IV", "Call OI", "Call Change OI",
+            "OTM Call Strike", "Call LTP", "Call Volume", "Call IV", "Call OI", "Call Change OI",
             "Call Total Buy", "Call Total Sell", "Call Buy-Sell Diff",
             "Call Bid", "Call Ask", "Call Bid-Ask Diff",
-            "OTM Put Strike", "Put IV", "Put OI", "Put Change OI",
+            "OTM Put Strike", "Put LTP", "Put Volume", "Put IV", "Put OI", "Put Change OI",
             "Put Total Buy", "Put Total Sell", "Put Buy-Sell Diff",
             "Put Bid", "Put Ask", "Put Bid-Ask Diff",
             "PCR OI", "PCR Change OI"
@@ -2312,35 +1953,52 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
         # Ensure headers exist.
         try:
             if history_sheet.range("A1").value != "Feed Time":
-                history_sheet.range("A1:AA1").value = headers
-                history_sheet.range("B:B").number_format = "yyyy-mm-dd hh:mm:ss"
+                history_sheet.range("A1:AE1").value = headers
+                history_sheet.range("A:C").number_format = "@"
         except Exception:
-            history_sheet.range("A1:Z1").value = headers
+            history_sheet.range("A1:AE1").value = headers
 
         row_data = [
             feed_time,
-            now_dt,
+            now_dt.strftime("%Y-%m-%d %H:%M:%S"),
             last_traded_time,
             *market_values,
         ]
 
         # ------------------------------------------------------------
-        # TRUE HIGH-SPEED APPEND BUFFER
-        # Do NOT call Excel COM for every tick. Put the complete row in
-        # memory and flush several rows together every 250 ms.
+        # APPEND EXACTLY ONE NEW ROW
         # ------------------------------------------------------------
-        global pending_history_rows, history_next_row
-        pending_history_rows.append(row_data)
+        try:
+            last_row = get_last_actual_row(history_sheet, "A", 1)
+            next_row = max(2, last_row + 1)
+        except Exception:
+            next_row = tick_counter + 2
+
+        # Force all three time columns to TEXT before writing. This prevents
+        # Excel from converting 20:03:46 into the 1900 date system.
+        history_sheet.range(f"A{next_row}:C{next_row}").number_format = "@"
+        history_sheet.range(f"A{next_row}:C{next_row}").value = [[
+            str(row_data[0] or ""),
+            str(row_data[1] or ""),
+            str(row_data[2] or ""),
+        ]]
+        history_sheet.range(f"D{next_row}:AE{next_row}").number_format = "#,##0.00"
+        history_sheet.range(f"D{next_row}:AE{next_row}").value = [[*row_data[3:]]]
 
         tick_counter += 1
         last_tick_signature = signature
 
-        # Keep the console quiet; printing every tick also slows Python.
-        if tick_counter == 1 or tick_counter % 100 == 0:
-            print(
-                f"⚡ Tick {tick_counter} buffered | "
-                f"{now_dt.strftime('%H:%M:%S')} | Spot={market_values[0]:.2f}"
-            )
+        # Autofit only occasionally; never every refresh.
+        if tick_counter == 1 or tick_counter % 50 == 0:
+            try:
+                history_sheet.autofit()
+            except Exception:
+                pass
+
+        print(
+            f"✅ Tick {tick_counter} written at row {next_row} | "
+            f"{now_dt.strftime('%H:%M:%S')} | Spot={market_values[0]:.2f}"
+        )
 
     except Exception as e:
         print(f"⚠️ Error storing tick data: {e}")
@@ -2351,11 +2009,38 @@ def store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strik
 # ----------------------------------------------------------------------
 # Main option chain loop
 # ----------------------------------------------------------------------
+
+def get_nse_strike_classification(df_full, spot_ltp):
+    try:
+        spot = float(spot_ltp or 0)
+    except Exception:
+        spot = 0.0
+
+    strikes = []
+    try:
+        col = next((c for c in ["Strike", "Strike Price", "strike", "strprc"]
+                    if c in df_full.columns), None)
+        if col:
+            strikes = sorted({float(x) for x in df_full[col].tolist()
+                              if x is not None and str(x).strip() != ""})
+    except Exception:
+        pass
+
+    if not strikes:
+        return {"atm": None, "ce_itm": set(), "ce_otm": set(),
+                "pe_itm": set(), "pe_otm": set()}
+
+    atm = min(strikes, key=lambda x: abs(x - spot))
+    return {
+        "atm": atm,
+        "ce_itm": {x for x in strikes if x < atm},
+        "ce_otm": {x for x in strikes if x > atm},
+        "pe_itm": {x for x in strikes if x > atm},
+        "pe_otm": {x for x in strikes if x < atm},
+    }
+
 def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
-    global tick_counter, feed_time, request_time, last_traded_time, last_aggregation_time, AGGREGATION_INTERVAL
-    global market_data_version, last_processed_market_data_version, last_optionchain_signature
-    global last_atm_highlight_strike, last_saved_market_data_version, last_excel_save_time
-    global last_history_tick_counter_for_candle, last_candle_update_mono, last_config_read_mono
+    global tick_counter, feed_time, request_time, last_traded_time, last_aggregation_time, AGGREGATION_INTERVAL, POST_MARKET_ENABLED, POST_MARKET_END
         
     fut_token = get_index_future_token()
     if fut_token is not None:
@@ -2365,65 +2050,55 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
     build_option_chain_template()
     dump_available_expiries(oc_sheet)
 
+    # Auto-fill Expiry (B1) with the nearest upcoming expiry if it's blank,
+    # and report which of the core config cells (B1-B4) still need attention.
+    _auto_select_expiry_if_blank(oc_sheet)
+    _report_blank_config_cells(oc_sheet)
+
     pre_expiry = None
     pre_no_of_strike = None
-    refresh_rate = 0.20
+    refresh_rate = 1
     last_aggregation_time = None
-    last_candle_update_mono = 0.0
-    last_config_read_mono = 0.0
-    print("⚡ HIGH-SPEED MODE: process changed WebSocket ticks only")
-    print("⚡ Excel writes: only changed OptionChain rows + new Tick_History rows")
-    print("⚡ Workbook save: batched, not every refresh")
     
     # Check Tick_History status at startup
     check_tick_history_status(history_sheet)
 
     while True:
         try:
-            # Read Excel controls only twice per second. Reading COM cells on
-            # every 0.2-second cycle was itself a major speed bottleneck.
-            now_mono = time.monotonic()
-            if (now_mono - last_config_read_mono) >= CONFIG_READ_INTERVAL:
-                agg_interval = oc_sheet.range("B4").value
-                if agg_interval and isinstance(agg_interval, (int, float)) and agg_interval > 0:
-                    if int(agg_interval) != AGGREGATION_INTERVAL:
-                        AGGREGATION_INTERVAL = int(agg_interval)
-                        print(f"✅ Aggregation interval updated to {AGGREGATION_INTERVAL} minutes")
-                        candle_sheet.range("A1").value = f"{AGGREGATION_INTERVAL}-Minute Candle Data"
+            # Check for updated aggregation interval from Excel
+            agg_interval = oc_sheet.range("B4").value
+            if agg_interval and isinstance(agg_interval, (int, float)) and agg_interval > 0:
+                if int(agg_interval) != AGGREGATION_INTERVAL:
+                    AGGREGATION_INTERVAL = int(agg_interval)
+                    print(f"✅ Aggregation interval updated to {AGGREGATION_INTERVAL} minutes")
+                    # No title row to update anymore - interval is shown on
+                    # OptionChain!B4 and headers now sit in Candel row 1.
+            
+            expiry_str = oc_sheet.range("B1").value
+            if not expiry_str:
+                expiry_str = _auto_select_expiry_if_blank(oc_sheet)
 
-                expiry_str = oc_sheet.range("B1").value
-                try:
-                    expiry_input = parse_date(expiry_str)
-                except ValueError as e:
-                    oc_sheet.range("C1").value = f"Invalid date format: {expiry_str}"
-                    print(f"❌ Date parsing error: {e}")
-                    time.sleep(1)
-                    continue
-
-                no_of_strike = int(oc_sheet.range("B2").value or NUMBER_OF_STRIKES)
-                raw_refresh = oc_sheet.range("B3").value
-                try:
-                    refresh_rate = max(0.10, float(raw_refresh or 0.20))
-                except Exception:
-                    refresh_rate = 0.20
-                last_config_read_mono = now_mono
-
-            # If configuration has not been read yet, read it immediately.
-            if 'expiry_input' not in locals():
-                expiry_str = oc_sheet.range("B1").value
+            try:
                 expiry_input = parse_date(expiry_str)
-                no_of_strike = int(oc_sheet.range("B2").value or NUMBER_OF_STRIKES)
-                raw_refresh = oc_sheet.range("B3").value
-                refresh_rate = max(0.10, float(raw_refresh or 0.20))
-                last_config_read_mono = now_mono
-
-            # FAST PATH: if the WebSocket has delivered no changed market
-            # fields since the previous cycle, skip all dataframe/IV/Excel work.
-            if (market_data_version == last_processed_market_data_version
-                    and pre_expiry == expiry_input
-                    and pre_no_of_strike == no_of_strike):
-                time.sleep(refresh_rate)
+            except ValueError as e:
+                oc_sheet.range("C1").value = f"Invalid date format: {expiry_str}"
+                print(f"❌ Date parsing error: {e}")
+                time.sleep(2)
                 continue
+
+            no_of_strike = int(oc_sheet.range("B2").value or NUMBER_OF_STRIKES)
+            refresh_rate = max(0.05, float(oc_sheet.range("B3").value or 0.10))
+            iv_underlying_mode = str(oc_sheet.range("B7").value or "SPOT").strip().upper()
+
+            # Optional post-market window
+            pm_value = str(oc_sheet.range("B5").value or "ON").strip().upper()
+            POST_MARKET_ENABLED = pm_value in ("ON", "YES", "TRUE", "1")
+            end_value = str(oc_sheet.range("B6").value or "23:59").strip()
+            try:
+                hh, mm = [int(x) for x in end_value.split(":")[:2]]
+                POST_MARKET_END = hh * 60 + mm
+            except Exception:
+                POST_MARKET_END = 23 * 60 + 59
 
             if not expiry_input:
                 time.sleep(1)
@@ -2448,31 +2123,23 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                         subscribe_token(EXCHANGE, s["CE_Token"])
                 subs_lst.append(SYMBOL)
 
-            # HIGH-SPEED: use the already-received WebSocket snapshot.
-            # Avoid a REST get_quotes() request every refresh cycle.
+            # Spot/future tokens are already subscribed over the websocket at
+            # the top of run_option_chain, so pull them from live_data (like
+            # every other field) instead of blocking on a REST round trip
+            # every single loop iteration. Only fall back to REST if the
+            # websocket hasn't delivered a tick for that token yet (cold start).
             spot_key = f"{SPOT_EXCHANGE}|{NIFTY_SPOT_TOKEN}"
             spot_ltp = convert_to_float(get_field(spot_key, "lp", 0))
-            if spot_ltp <= 0:
-                # Only use REST as a startup/recovery fallback.
-                try:
-                    spot_ltp = convert_to_float(api.get_quotes(SPOT_EXCHANGE, str(NIFTY_SPOT_TOKEN)).get("lp"))
-                except Exception:
-                    spot_ltp = 0.0
+            if spot_ltp == 0:
+                spot_ltp = convert_to_float(api.get_quotes(SPOT_EXCHANGE, str(NIFTY_SPOT_TOKEN)).get("lp"))
 
             if fut_token:
-                future_key = f"{EXCHANGE}|{fut_token}"
-                future_ltp = convert_to_float(get_field(future_key, "lp", 0))
-                if future_ltp <= 0:
-                    try:
-                        future_ltp = convert_to_float(api.get_quotes(EXCHANGE, str(fut_token)).get("lp"))
-                    except Exception:
-                        future_ltp = spot_ltp
+                fut_key = f"{EXCHANGE}|{fut_token}"
+                future_ltp = convert_to_float(get_field(fut_key, "lp", 0))
+                if future_ltp == 0:
+                    future_ltp = convert_to_float(api.get_quotes(EXCHANGE, str(fut_token)).get("lp"))
             else:
                 future_ltp = spot_ltp
-
-            if spot_ltp <= 0:
-                time.sleep(refresh_rate)
-                continue
 
             rows = []
             for s in strikes:
@@ -2524,30 +2191,10 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
 
             df_full = pd.DataFrame(rows).sort_values(by="strike").reset_index(drop=True)
 
-            # ============================================================
-            # NSE-STYLE ACTUAL STRIKE CLASSIFICATION
-            # ============================================================
-            strike_class = get_nse_strike_classification(df_full, spot_ltp)
-
-            atm_strike = strike_class["atm"]
-            ce_itm_strike = strike_class["ce_itm"]
-            ce_otm_strike = strike_class["ce_otm"]
-            pe_itm_strike = strike_class["pe_itm"]
-            pe_otm_strike = strike_class["pe_otm"]
-
-            if atm_strike is None:
-                print("⚠️ No actual NSE strike available for current spot.")
-                time.sleep(refresh_rate)
-                continue
-
-            # Locate the actual ATM row.
-            atm_matches = df_full[df_full["strike"] == atm_strike]
-            if atm_matches.empty:
-                print("⚠️ ATM strike row not found.")
-                time.sleep(refresh_rate)
-                continue
-
-            atm_idx = atm_matches.index[0]
+            # Find the index of the strike closest to spot
+            df_full["strike_diff"] = abs(df_full["strike"] - spot_ltp)
+            atm_idx = df_full["strike_diff"].idxmin()
+            atm_strike = df_full.loc[atm_idx, "strike"]
 
             # Get ATM data
             atm_ce_price = df_full.loc[atm_idx, "CE_lp"]
@@ -2559,33 +2206,14 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
             print("🔄 Updating IV calculator with current market snapshot...")
             if not init_iv_calculator(
                 spot_ltp, future_ltp, atm_strike,
-                atm_ce_price, atm_pe_price, expiry_input
+                atm_ce_price, atm_pe_price, expiry_input,
+                underlying_mode=iv_underlying_mode
             ):
                 print("⚠️ IV calculator update failed; IV will be 0 for this refresh.")
             pre_expiry = expiry_input
 
-            # First OTM strikes from ACTUAL NSE/NFO strike list.
-            otm_call_strike = ce_otm_strike
-            otm_put_strike = pe_otm_strike
-
-            # Defensive fallback only if the instrument list has no
-            # strike on one side.
-            if otm_call_strike is None:
-                otm_call_strike = get_first_otm_strikes(
-                    df_full, spot_ltp, atm_strike, STRIKE_STEP
-                )[0]
-
-            if otm_put_strike is None:
-                otm_put_strike = get_first_otm_strikes(
-                    df_full, spot_ltp, atm_strike, STRIKE_STEP
-                )[1]
-
-            print(
-                f"🎯 NSE strikes | Spot={spot_ltp:.2f} | "
-                f"ATM={atm_strike} | "
-                f"CE ITM={ce_itm_strike} | CE OTM={ce_otm_strike} | "
-                f"PE ITM={pe_itm_strike} | PE OTM={pe_otm_strike}"
-            )
+            # Get first OTM Call and Put strikes from FULL dataframe
+            otm_call_strike, otm_put_strike = get_first_otm_strikes(df_full, spot_ltp, atm_strike, STRIKE_STEP)
 
             # Trim to N strikes each side of ATM for display
             lo = max(0, atm_idx - no_of_strike)
@@ -2624,6 +2252,8 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                 "Spot": [spot_ltp] * len(df_display),
                 "ATM Strike": [atm_strike] * len(df_display),
                 "Call Strike": df_display["strike"],
+                "Call LTP": df_display["CE_lp"],
+                "Call Volume": df_display["CE_v"],
                 "Call IV": call_iv_list,
                 "Call OI": df_display["CE_oi"],
                 "Call Change OI": df_display["CE_coi"],
@@ -2634,6 +2264,8 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                 "Call Ask": df_display["CE_sp1"],
                 "Call Bid-Ask Diff": df_display["CE_sp1"] - df_display["CE_bp1"],
                 "Put Strike": df_display["strike"],
+                "Put LTP": df_display["PE_lp"],
+                "Put Volume": df_display["PE_v"],
                 "Put IV": put_iv_list,
                 "Put OI": df_display["PE_oi"],
                 "Put Change OI": df_display["PE_coi"],
@@ -2657,71 +2289,49 @@ def run_option_chain(wb, oc_sheet, history_sheet, candle_sheet):
                 ),
             })
 
-            # Build a market-data-only signature. Time fields are deliberately
-            # excluded so Excel is not rewritten merely because the clock moved.
-            display_signature = tuple(
-                tuple(round(float(x), 8) if isinstance(x, (int, float, np.number)) else str(x)
-                      for x in row)
-                for row in df_final.iloc[:, 3:].to_numpy().tolist()
-            )
-
-            config_changed = (pre_expiry != expiry_input or pre_no_of_strike != no_of_strike)
-            if config_changed:
+            if pre_expiry != expiry_input or pre_no_of_strike != no_of_strike:
                 oc_sheet.range("A11:AA1000").value = None
+                oc_sheet.range("A11:AA1000").color = None
+                global _last_atm_highlight_row
+                _last_atm_highlight_row = None
                 pre_expiry, pre_no_of_strike = expiry_input, no_of_strike
-                last_optionchain_signature = None
-                last_atm_highlight_strike = None
 
-            optionchain_changed = config_changed or display_signature != last_optionchain_signature
-            if optionchain_changed:
-                oc_sheet.range("A10").options(index=False, header=True).value = df_final
-                last_optionchain_signature = display_signature
+            oc_sheet.range("A10").options(index=False, header=True).value = df_final
 
-                # ATM formatting is expensive. Do it only when the ATM row
-                # actually changes or the table was rebuilt.
-                if last_atm_highlight_strike != atm_strike:
-                    apply_atm_highlight(oc_sheet, atm_strike)
-                    last_atm_highlight_strike = atm_strike
-
-            # Store Tick_History only on a new market-data cycle.
-            before_ticks = tick_counter
+            # atm_idx is the position in df_full; lo is where df_display was
+            # sliced from - so this is the exact displayed row without any
+            # Excel read-back.
+            apply_atm_highlight(oc_sheet, 11 + (atm_idx - lo))
+            
+            # Store tick data using FULL dataframe with IV calculation
             store_tick_data(history_sheet, df_full, spot_ltp, atm_strike, otm_call_strike, otm_put_strike, expiry_input, future_ltp, atm_ce_price, atm_pe_price)
-            new_history_tick = tick_counter > before_ticks
+            
+            # ============================================================
+            # AGGREGATE CANDLES - APPEND new candles
+            # ============================================================
+            current_time = dt.now()
 
-            # Flush buffered ticks in one Excel write. Then update the candle
-            # at most twice per second, instead of recalculating it for every
-            # market tick.
-            flushed = flush_pending_history(history_sheet, force=False)
-            if flushed > 0:
-                now_candle = time.monotonic()
-                if (now_candle - last_candle_update_mono) >= CANDLE_UPDATE_INTERVAL:
-                    aggregate_candles(history_sheet, candle_sheet, AGGREGATION_INTERVAL)
-                    last_candle_update_mono = now_candle
-                    last_history_tick_counter_for_candle = tick_counter
-
-            # Status cell is updated only when market data/configuration changed.
-            if optionchain_changed or new_history_tick:
-                oc_sheet.range("C1").value = (
-                    f"{SYMBOL} Spot={spot_ltp:.1f}  ATM={atm_strike}  "
-                    f"CE ITM={ce_itm_strike}  CE OTM={otm_call_strike}  "
-                    f"PE ITM={pe_itm_strike}  PE OTM={otm_put_strike}  "
-                    f"Ticks={tick_counter}  Aggregation={AGGREGATION_INTERVAL}min  "
-                    f"Feed={feed_time}  Req={request_time}  LTT={last_traded_time}  "
-                    f"IV=LIVE DTE={current_iv_dte_days} T={current_iv_T:.8f} r=10%"
+            # ULTRA-FAST CANDLE UPDATE:
+            # Update the current 1-minute candle immediately after each
+            # NEW market snapshot. Do not wait another 60 seconds.
+            global last_candle_tick_counter
+            if tick_counter >= 1 and tick_counter != last_candle_tick_counter:
+                aggregate_candles(
+                    history_sheet,
+                    candle_sheet,
+                    AGGREGATION_INTERVAL
                 )
-
-            # Do not save the workbook on every 1-second cycle. Save only
-            # after actual Excel changes, with a short safety batch interval.
-            if optionchain_changed or new_history_tick:
-                now_mono = time.monotonic()
-                if (now_mono - last_excel_save_time >= 1.0) or config_changed:
-                    # Never save with an unflushed Tick_History buffer.
-                    flush_pending_history(history_sheet, force=True)
-                    wb.save()
-                    last_excel_save_time = now_mono
-                    last_saved_market_data_version = market_data_version
-
-            last_processed_market_data_version = market_data_version
+                last_candle_tick_counter = tick_counter
+            
+            oc_sheet.range("C1").value = (
+                f"{SYMBOL} Spot={spot_ltp:.1f}  ATM={atm_strike}  "
+                f"OTM Call={otm_call_strike} (ABOVE)  OTM Put={otm_put_strike} (BELOW)  "
+                f"Ticks={tick_counter}  Aggregation={AGGREGATION_INTERVAL}min  "
+                f"Feed={feed_time}  Req={request_time}  LTT={last_traded_time}  "
+                f"IV=LIVE({current_iv_underlying_mode}={current_iv_underlying:.2f}) "
+                f"DTE={current_iv_dte_days} T={current_iv_T:.8f} r=10%"
+            )
+            wb.save()
 
         except Exception as e:
             print(f"Loop exception: {e}")
@@ -2738,16 +2348,10 @@ if __name__ == "__main__":
     print(f"Symbol: {SYMBOL}")
     print(f"Number of strikes each side: {NUMBER_OF_STRIKES}")
     print(f"Default candle interval: {AGGREGATION_INTERVAL} minutes")
+    print("ULTRA-FAST: Candel updates on every NEW tick; refresh >= 0.05 sec")
     print("-" * 50)
     
     wb, login_sheet, oc_sheet, history_sheet, candle_sheet = get_or_create_workbook()
-
-    # ==========================================================
-    # IP SECURITY CHECK - MUST PASS BEFORE SHOONYA LOGIN
-    # ==========================================================
-    if not check_login_ip(login_sheet):
-        print("❌ IP verification failed. Program terminated.")
-        sys.exit(1)
 
     if not shoonya_login(login_sheet):
         print("❌ Login failed. Check the Login sheet.")
@@ -2755,41 +2359,99 @@ if __name__ == "__main__":
 
     load_instruments()
 
-    # --------------------------------------------------------------
-    # Start WebSocket with the CURRENT OAuth session.
-    # Authentication recovery has already happened inside
-    # shoonya_login().
-    # --------------------------------------------------------------
-    feed_opened = False
-    print("🔌 Starting WebSocket with current OAuth session...")
-    print(f"   WebSocket UID : {getattr(api, 'uid', '')}")
-    print(f"   WebSocket ACTID: {getattr(api, 'actid', '')}")
-    print(f"   Token loaded  : {str(getattr(api, 'token', ''))[:20]}...")
+    # Start WebSocket. If the saved token cannot open it, use the saved
+    # AUTH CODE first. Only if getAccessToken(AUTH_CODE) returns None do
+    # we generate a new browser OAuth code.
+    def start_ws_and_wait(seconds=15):
+        global feed_opened
+        feed_opened = False
+        api.start_websocket(
+            order_update_callback=event_handler_order_update,
+            subscribe_callback=event_handler_quote_update,
+            socket_open_callback=open_callback,
+            socket_close_callback=event_handler_socket_closed,
+        )
+        for _ in range(seconds * 10):
+            if feed_opened:
+                return True
+            time.sleep(0.1)
+        return feed_opened
 
-    api.start_websocket(
-        order_update_callback=event_handler_order_update,
-        subscribe_callback=event_handler_quote_update,
-        socket_open_callback=open_callback,
-        socket_close_callback=event_handler_socket_closed,
-    )
+    print("🔌 Starting WebSocket with current session...")
+    if not start_ws_and_wait(15):
+        print("⚠️ Saved-token WebSocket did not open.")
+        login_data = get_all_login_data(login_sheet)
+        print("🔐 Trying SAVED AUTH CODE before any browser login...")
+        if login_data.get("auth_code") and _login_from_auth_code(login_sheet, login_data, login_data["auth_code"]):
+            if not start_ws_and_wait(15):
+                print("❌ WebSocket still did not open after saved AUTH CODE.")
+                print("   Browser login is NOT started unless AUTH CODE returned None.")
+        elif login_data.get("auth_code"):
+            # IMPORTANT: getAccessToken() returned None.  Do NOT call shoonya_login()
+            # here because shoonya_login() is intentionally TOKEN-FIRST and would
+            # simply reuse the same rejected token again.
+            print("🚨 SAVED AUTH CODE WAS REJECTED (getAccessToken returned None).")
+            print("🔄 Generating ONE NEW OAuth AUTH CODE now...")
+            print("--------------------------------------------------")
+            try:
+                if not login_data.get("password") or not login_data.get("totp_secret"):
+                    print("❌ Password/TOTP missing; cannot generate new OAuth code.")
+                    sys.exit(1)
 
-    # IMPORTANT:
-    # A WebSocket timeout is NOT automatically treated as a market-data
-    # timeout.  Noren may reconnect asynchronously.  Wait patiently.
-    websocket_wait = 0
-    while not feed_opened and websocket_wait < 60:
-        time.sleep(0.5)
-        websocket_wait += 0.5
+                new_api = _make_api()
+                auth_code_new = get_auth_code_via_selenium(
+                    login_data["client_id"],
+                    login_data["user_id"],
+                    login_data["password"],
+                    login_data["totp_secret"],
+                )
+                if not auth_code_new:
+                    print("❌ Browser did not return a new AUTH CODE.")
+                    sys.exit(1)
+
+                print(f"   Auth code obtained: {auth_code_new[:20]}...")
+                # Exchange the NEW code on the NEW API object.
+                login_data = get_all_login_data(login_sheet)
+                if not _login_from_auth_code(login_sheet, login_data, auth_code_new):
+                    print("❌ New AUTH CODE could not produce an access token.")
+                    sys.exit(1)
+
+                print("🔌 Starting WebSocket with NEW OAuth session...")
+                if not start_ws_and_wait(15):
+                    print("❌ WebSocket did not open after NEW OAuth login.")
+                    sys.exit(1)
+            except Exception as e:
+                print(f"❌ Fresh OAuth recovery failed: {e}")
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+        else:
+            # No saved AUTH CODE: generate one fresh code immediately.
+            print("⚠️ No saved AUTH CODE available.")
+            print("🔄 Generating ONE NEW OAuth AUTH CODE now...")
+            login_data = get_all_login_data(login_sheet)
+            if not login_data.get("password") or not login_data.get("totp_secret"):
+                print("❌ Password/TOTP missing; cannot generate new OAuth code.")
+                sys.exit(1)
+            auth_code_new = get_auth_code_via_selenium(
+                login_data["client_id"], login_data["user_id"],
+                login_data["password"], login_data["totp_secret"]
+            )
+            if not auth_code_new:
+                print("❌ Browser did not return a new AUTH CODE.")
+                sys.exit(1)
+            login_data = get_all_login_data(login_sheet)
+            if not _login_from_auth_code(login_sheet, login_data, auth_code_new):
+                print("❌ New AUTH CODE could not produce an access token.")
+                sys.exit(1)
+            if not start_ws_and_wait(15):
+                print("❌ WebSocket did not open after NEW OAuth login.")
+                sys.exit(1)
 
     if feed_opened:
         print("✅ WebSocket connected. Enter expiry/strike count in the OptionChain sheet.")
     else:
-        print("⚠️ WebSocket has not opened after 60 seconds.")
-        print("   Continuing; Noren's websocket may reconnect asynchronously.")
-        print("   No new OAuth code will be generated merely because no tick arrived.")
-
+        print("⚠️ WebSocket is not open yet; continuing without creating another sheet/login.")
     print("-" * 50)
 
-    # NEVER stop here merely because the first websocket/tick was delayed.
-    # The option-chain loop itself continues and handles market-data gaps.
     run_option_chain(wb, oc_sheet, history_sheet, candle_sheet)
